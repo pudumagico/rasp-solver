@@ -1,0 +1,43 @@
+services:
+  agent-1:
+    build: ..
+    dockerfile: harness/Dockerfile
+    environment:
+      - AGENT_ID=agent-1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - upstream:/upstream
+    command: bash harness/agent_loop.sh
+
+  agent-2:
+    build: ..
+    dockerfile: harness/Dockerfile
+    environment:
+      - AGENT_ID=agent-2
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - upstream:/upstream
+    command: bash harness/agent_loop.sh
+
+  agent-3:
+    build: ..
+    dockerfile: harness/Dockerfile
+    environment:
+      - AGENT_ID=agent-3
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - upstream:/upstream
+    command: bash harness/agent_loop.sh
+
+  agent-4:
+    build: ..
+    dockerfile: harness/Dockerfile
+    environment:
+      - AGENT_ID=agent-4
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - upstream:/upstream
+    command: bash harness/agent_loop.sh
+
+volumes:
+  upstream:
