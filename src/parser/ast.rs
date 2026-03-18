@@ -125,6 +125,9 @@ pub struct Aggregate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunction {
     Count,
+    Sum,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone)]

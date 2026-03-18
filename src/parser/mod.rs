@@ -340,7 +340,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_body_atom(&mut self) -> Result<BodyAtom, ParseError> {
-        if self.current == Token::Count {
+        if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
             return Ok(BodyAtom::Aggregate(self.parse_aggregate()?));
         }
         // Parse an atom or comparison. Comparisons have the form `term op term`.
@@ -400,7 +400,14 @@ impl<'a> Parser<'a> {
     // ── aggregates ─────────────────────────────────────────
 
     fn parse_aggregate(&mut self) -> Result<Aggregate, ParseError> {
-        self.advance()?; // #count
+        let function = match &self.current {
+            Token::Count => AggFunction::Count,
+            Token::Sum => AggFunction::Sum,
+            Token::Min => AggFunction::Min,
+            Token::Max => AggFunction::Max,
+            _ => return Err(self.error("expected aggregate function".to_string())),
+        };
+        self.advance()?;
         self.expect(&Token::LBrace)?;
         let elements = self.parse_agg_elements()?;
         self.expect(&Token::RBrace)?;
@@ -412,7 +419,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Aggregate { function: AggFunction::Count, elements, lower: None, upper })
+        Ok(Aggregate { function, elements, lower: None, upper })
     }
 
     fn parse_agg_elements(&mut self) -> Result<Vec<AggElement>, ParseError> {
