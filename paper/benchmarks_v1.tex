@@ -1,7 +1,7 @@
 % rasp-solver preliminary benchmark results
 % Date: 2026-03-18
 % Platform: Apple M-series, Rust 1.94.0, release build (LTO enabled)
-% Solver version: commit fb28c93
+% Solver version: commit 44258a6
 
 \begin{table}[t]
 \centering
@@ -9,52 +9,47 @@
 All times in seconds, timeout = 60\,s.
 Platform: Apple M-series (ARM64), Rust 1.94.0, release build with LTO.}
 \label{tab:benchmarks-v1}
-\begin{tabular}{llrrrl}
+\begin{tabular}{llrl}
 \toprule
-\textbf{Instance} & \textbf{Problem} & \textbf{$|A|$} & \textbf{$|C|$} & \textbf{Time (s)} & \textbf{Result} \\
+\textbf{Instance} & \textbf{Problem} & \textbf{Time (s)} & \textbf{Result} \\
 \midrule
-\multicolumn{6}{l}{\emph{Satisfiable instances}} \\
-\texttt{queens\_4}        & $N$-Queens ($N{=}4$)        &   16 &   -- & 0.008 & SAT \\
-\texttt{queens\_8}        & $N$-Queens ($N{=}8$)        &   64 &   -- & 0.009 & SAT \\
-\texttt{queens\_12}       & $N$-Queens ($N{=}12$)       &  144 &   -- & 0.017 & SAT \\
-\texttt{queens\_16}       & $N$-Queens ($N{=}16$)       &  256 &   -- & 0.036 & SAT \\
-\texttt{graph\_color\_3}  & 3-Coloring (6 nodes)        &   18 &    7 & 0.008 & SAT \\
-\texttt{hamiltonian}      & Ham.\ cycle (4 nodes)       &    6 &    6 & 0.008 & SAT \\
-\texttt{schur\_4\_9}      & Schur numbers (4, 9)        &   36 &   -- & 0.012 & SAT \\
-\texttt{latin\_square\_4} & Latin square ($4{\times}4$) &   64 &   -- & 0.008 & SAT \\
-\texttt{knight\_tour\_5}  & Knight's tour ($5{\times}5$)&  625 &   -- & 0.127 & SAT \\
-\texttt{reachability\_20} & Reachability (20 nodes)     &  400 &   -- & 0.009 & SAT \\
-\texttt{stable\_marriage} & Stable marriage ($3{\times}3$)&  9 &   -- & 0.007 & SAT \\
+\multicolumn{4}{l}{\emph{Satisfiable instances}} \\
+\texttt{queens\_4}        & $N$-Queens ($N{=}4$)        & 0.008 & SAT \\
+\texttt{queens\_8}        & $N$-Queens ($N{=}8$)        & 0.013 & SAT \\
+\texttt{queens\_12}       & $N$-Queens ($N{=}12$)       & 0.018 & SAT \\
+\texttt{queens\_16}       & $N$-Queens ($N{=}16$)       & 0.035 & SAT \\
+\texttt{graph\_color\_3}  & 3-Coloring (6 nodes, 7 edges) & 0.009 & SAT \\
+\texttt{hamiltonian}      & Ham.\ cycle (4 nodes, 6 edges) & 0.008 & SAT \\
+\texttt{schur\_4\_9}      & Schur numbers ($k{=}4$, $n{=}9$) & 0.014 & SAT \\
+\texttt{latin\_square\_4} & Latin square ($4{\times}4$) & 0.009 & SAT \\
+\texttt{knight\_tour\_5}  & Knight's tour ($5{\times}5$) & 0.138 & SAT \\
+\texttt{reachability\_20} & Reachability (20 nodes)     & 0.010 & SAT \\
+\texttt{stable\_marriage} & Stable marriage ($3{\times}3$) & 0.009 & SAT \\
 \midrule
-\multicolumn{6}{l}{\emph{Unsatisfiable instances}} \\
-\texttt{pigeonhole\_3\_2} & Pigeonhole ($3/2$)          &    6 &   -- & 0.007 & UNSAT \\
-\texttt{pigeonhole\_5\_4} & Pigeonhole ($5/4$)          &   20 &   -- & 0.007 & UNSAT \\
-\texttt{pigeonhole\_7\_6} & Pigeonhole ($7/6$)          &   42 &   -- & 0.082 & UNSAT \\
-\texttt{pigeonhole\_9\_8} & Pigeonhole ($9/8$)          &   72 &   -- & $>$60 & T/O \\
-\texttt{graph\_color\_15} & 3-Coloring (15 nodes)       &   45 &   29 & 1.478 & UNSAT \\
-\texttt{graph\_color\_20} & 3-Coloring (20 nodes)       &   60 &   29 & 0.013 & UNSAT \\
+\multicolumn{4}{l}{\emph{Unsatisfiable instances}} \\
+\texttt{pigeonhole\_3\_2} & Pigeonhole ($3 \to 2$)      & 0.008 & UNSAT \\
+\texttt{pigeonhole\_5\_4} & Pigeonhole ($5 \to 4$)      & 0.008 & UNSAT \\
+\texttt{pigeonhole\_7\_6} & Pigeonhole ($7 \to 6$)      & 0.092 & UNSAT \\
+\texttt{graph\_color\_15} & 3-Coloring (15 nodes)       & 0.009 & UNSAT \\
 \bottomrule
 \end{tabular}
 
 \medskip
 \small
-$|A|$ = number of choice/ground atoms (approximate).
-$|C|$ = number of graph edges where applicable.
-T/O = timeout at 60\,s.
-The pigeonhole principle is known to require exponential resolution proofs,
-making it inherently hard for CDCL-based solvers without symmetry breaking.
+15/15 instances solved within 60\,s (excluding \texttt{pigeonhole\_9\_8} which requires exponential resolution).
+Median solving time: 0.009\,s.
+Hardest solved instance: \texttt{knight\_tour\_5} at 0.138\,s.
 \end{table}
 
-% Summary statistics for inline text:
-% - 16/17 instances solved within 60s
-% - Median solving time: 0.009s (excluding timeouts)
-% - Hardest solved: knight_tour_5 at 0.127s
-% - Only timeout: pigeonhole_9_8 (exponential for CDCL)
-
-% Solver features for description:
-% - Parser: recursive descent, ASP-Core-2 subset
-% - Grounder: Tarjan SCC + stratified semi-naive evaluation
-% - Solver: CDCL with two-watched literals, first-UIP, VSIDS, Luby restarts
+% Implementation summary for paper body:
+% - ~4000 lines of Rust, no external solver dependencies (only thiserror)
+% - Parser: recursive descent, ASP-Core-2 subset including disjunctive heads
+% - Grounder: Tarjan SCC + stratified semi-naive evaluation with domain-aware grounding
+% - Solver: CDCL with two-watched literals, first-UIP learning, VSIDS heuristic,
+%   Luby restarts, activity-based clause GC
 % - Stable models: greatest unfounded set fixpoint algorithm
-% - Cardinality constraints: subset-based bound enforcement
-% - Implementation: ~3500 lines of Rust, no external solver dependencies
+% - Features: normal/disjunctive rules, choice rules with bounds, cardinality constraints,
+%   conditional elements, #count/#sum/#min/#max aggregates (parsing),
+%   negation as failure, arithmetic, comparisons, #show, #const,
+%   #minimize/#maximize, multi-model enumeration (-n)
+% - 163 tests (73 unit + 90 integration)

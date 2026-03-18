@@ -1,41 +1,50 @@
 # ASP Solver — Progress Tracker
 
-## Phase 0–4: Core Solver (Complete)
-- [x] Parser: lexer + recursive descent (facts, rules, constraints, choice rules, arithmetic, comparisons, `#show`, `#const`, `#count`, `= N` cardinality syntax, conditional elements)
-- [x] Grounder: Tarjan SCC + stratified semi-naive evaluation, domain-aware grounding, non-stratifiable programs, cardinality bound enforcement
-- [x] CDCL Solver: two-watched-literal BCP, first-UIP conflict analysis, VSIDS + phase saving, Luby restarts, learned clause GC
-- [x] Unfounded set detection: greatest fixpoint algorithm, loop nogoods, choice atom semantics
+## Core Solver (Complete)
+- [x] Parser: recursive descent with full ASP-Core-2 subset
+  - Facts, rules, constraints, disjunctive heads (`a | b :- c.`)
+  - Choice rules with bounds (`L { ... } U`, `{ ... } = N`)
+  - Conditional elements (`{a(X) : p(X)}`)
+  - Arithmetic, comparisons, negation as failure
+  - `#show`, `#const`, `#count`, `#sum`, `#min`, `#max`
+  - `#minimize`, `#maximize`
+- [x] Grounder: Tarjan SCC + stratified semi-naive evaluation
+  - Domain-aware grounding (choice atoms visible everywhere)
+  - Non-stratifiable programs supported
+  - Cardinality bound enforcement via subset constraints
+  - Conditional choice element expansion
+- [x] CDCL Solver: two-watched-literal BCP, first-UIP, VSIDS + phase saving, Luby restarts
+  - Learned clause GC (activity-based)
+  - Multi-model enumeration (`-n N`)
+  - Blocking clause model exclusion
+- [x] Unfounded set detection: greatest fixpoint, loop nogoods, choice/disjunction semantics
+- [x] Output: ASP Competition format
+- [x] CLI: `-n N` flag, stdin/file input, `#minimize`/`#maximize` support
 
-## Phase 5: Test Harness (Complete)
-- [x] 152 tests (73 unit + 79 integration), all passing
-- [x] Oracle comparison script, CI fast script
-- [x] GitHub Actions CI
+## Tests & Benchmarks
+- **163 tests** (73 unit + 90 integration), all passing, 0 clippy warnings
+- **16 benchmark instances** across 8 problem types
+- GitHub Actions CI
+- Oracle comparison + benchmark scripts
 
-## Phase 6–7: Benchmarks & Performance (Complete)
-- [x] 16 benchmark instances across 8 problem types
-- [x] Benchmark runner + comparison script (vs clingo)
-- [x] HashSet dedup, clause GC, targeted VSIDS reinsertion
+## Benchmark Results (release, Apple M-series)
+| Instance | Problem | Time | Result |
+|----------|---------|------|--------|
+| queens_8 | 8-Queens | 13ms | SAT |
+| queens_12 | 12-Queens | 18ms | SAT |
+| queens_16 | 16-Queens | 35ms | SAT |
+| pigeonhole_7_6 | 7→6 holes | 92ms | UNSAT |
+| graph_color_3 | 3-coloring 6n | 9ms | SAT |
+| hamiltonian | Ham. cycle 4n | 8ms | SAT |
+| schur_4_9 | Schur(4,9) | 14ms | SAT |
+| latin_square_4 | Latin 4×4 | 9ms | SAT |
+| knight_tour_5 | Knight 5×5 | 138ms | SAT |
+| stable_marriage | SM 3×3 | 9ms | SAT |
 
-## Benchmark Results (release build, Apple M-series)
-
-| Instance | Problem | Result | Time |
-|----------|---------|--------|------|
-| queens_8 | 8-Queens | SAT | 9ms |
-| queens_12 | 12-Queens | SAT | 17ms |
-| queens_16 | 16-Queens | SAT | 32ms |
-| pigeonhole_7_6 | 7-in-6 holes | UNSAT | 81ms |
-| graph_color_3 | 3-coloring (6 nodes) | SAT | 9ms |
-| hamiltonian | Ham. cycle (4 nodes) | SAT | 9ms |
-| schur_4_9 | Schur numbers (4,9) | SAT | 11ms |
-| latin_square_4 | Latin square 4×4 | SAT | 9ms |
-| knight_tour_5 | Knight's tour 5×5 | SAT | 131ms |
-| reachability_20 | Reachability (20 nodes) | SAT | 11ms |
-| stable_marriage | Stable marriage (3×3) | SAT | 8ms |
-
-## Remaining
-- [ ] Disjunctive heads (`a | b :- c.`)
-- [ ] Optimization statements (`#minimize`, `#maximize`)
-- [ ] `#sum`, `#min`, `#max` aggregates
-- [ ] Multi-answer-set enumeration (`-n 0`)
-- [ ] Grounder: first-argument hash index
-- [ ] Arena allocators
+## Remaining for Full Competition Readiness
+- [ ] `#sum`/`#min`/`#max` aggregate grounding (parsed, not yet grounded)
+- [ ] Iterative optimization for `#minimize` (currently shows cost of first model)
+- [ ] Weak constraints (`~`)
+- [ ] Pools in atoms (`p(1..n)`)
+- [ ] `@` priority levels in optimization
+- [ ] Larger competition instances for stress testing
