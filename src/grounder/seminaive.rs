@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ground::program::{AtomTable, GroundAtom, GroundProgram, GroundRule, RuleHead};
 use crate::interner::Interner;
-use crate::parser::ast::{self, Statement};
-use crate::types::{SymbolId, Value};
+use crate::parser::ast::{self, Statement, Term};
+use crate::types::{AtomId, SymbolId, Value};
 
 use super::instantiate::{self, FactStore};
 use super::scc::Stratum;
@@ -120,6 +120,15 @@ fn evaluate_stratum(
     // 1. Ground choice rules first so their atoms enter the domain
     for ch in &choices {
         let ground_rules = instantiate::instantiate_choice(ch, facts, atom_table, const_map);
+        // Generate bound constraints for each grounded choice rule
+        for gr in &ground_rules {
+            if let RuleHead::Choice(heads) = &gr.head {
+                let bound_constraints = generate_bound_constraints(
+                    heads, &ch.lower, &ch.upper, &gr.body_pos, &gr.body_neg, const_map,
+                );
+                all_rules.extend(bound_constraints);
+            }
+        }
         all_rules.extend(ground_rules);
     }
 
@@ -169,6 +178,88 @@ fn evaluate_stratum(
     for c in &constraints {
         let ground_rules = instantiate::instantiate_constraint(&c.body, facts, &domain, atom_table, const_map);
         all_rules.extend(ground_rules);
+    }
+}
+
+/// Generate constraint rules to enforce choice rule bounds.
+/// Lower bound L: at least L head atoms must be true (when body holds).
+/// Upper bound U: at most U head atoms can be true (when body holds).
+fn generate_bound_constraints(
+    heads: &[AtomId],
+    lower: &Option<Term>,
+    upper: &Option<Term>,
+    body_pos: &[AtomId],
+    body_neg: &[AtomId],
+    const_map: &HashMap<SymbolId, Value>,
+) -> Vec<GroundRule> {
+    let mut rules = Vec::new();
+    let n = heads.len();
+
+    let eval_bound = |term: &Term| -> Option<usize> {
+        let val = instantiate::eval_term(term, &HashMap::new(), const_map)?;
+        match val {
+            Value::Int(v) if v >= 0 => Some(v as usize),
+            _ => None,
+        }
+    };
+
+    // Upper bound: at most U can be true → every (U+1)-subset must have a false atom
+    // Constraint: `:- body, h1, h2, ..., h_{U+1}` for each (U+1)-subset
+    if let Some(u_term) = upper
+        && let Some(u) = eval_bound(u_term)
+            && u < n {
+                let subset_size = u + 1;
+                for_each_subset(heads, subset_size, &mut |subset| {
+                    let mut bp = body_pos.to_vec();
+                    bp.extend_from_slice(subset);
+                    rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
+                });
+            }
+
+    // Lower bound: at least L must be true → constraint fires if fewer than L are true
+    // Constraint: `:- body, not h1, not h2, ..., not h_{n-L+1}` for each (n-L+1)-subset
+    // i.e., if n-L+1 atoms are false, the bound is violated
+    if let Some(l_term) = lower
+        && let Some(l) = eval_bound(l_term)
+            && l > 0 {
+                if l > n {
+                    // Impossible: need more atoms than exist → always UNSAT when body holds
+                    rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: body_neg.to_vec() });
+                } else {
+                    let false_count = n - l + 1;
+                    for_each_subset(heads, false_count, &mut |subset| {
+                        let mut bn = body_neg.to_vec();
+                        bn.extend_from_slice(subset);
+                        rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
+                    });
+                }
+            }
+
+    rules
+}
+
+/// Call `callback` with every k-element subset of `elems`.
+fn for_each_subset(elems: &[AtomId], k: usize, callback: &mut impl FnMut(&[AtomId])) {
+    if k == 0 {
+        callback(&[]);
+        return;
+    }
+    if k > elems.len() { return; }
+    let mut indices: Vec<usize> = (0..k).collect();
+    loop {
+        let subset: Vec<AtomId> = indices.iter().map(|&i| elems[i]).collect();
+        callback(&subset);
+        // Advance to next combination
+        let mut i = k;
+        loop {
+            if i == 0 { return; }
+            i -= 1;
+            indices[i] += 1;
+            if indices[i] <= elems.len() - k + i { break; }
+        }
+        for j in (i + 1)..k {
+            indices[j] = indices[j - 1] + 1;
+        }
     }
 }
 

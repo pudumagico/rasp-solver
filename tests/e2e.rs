@@ -549,3 +549,82 @@ fn self_join() {
         &["p(1,2)", "p(2,3)", "q(1,3)"],
     );
 }
+
+// ── Cardinality bounds ────────────────────────────────────
+
+#[test]
+fn choice_upper_bound() {
+    // { a; b; c } 1. — at most 1 can be true
+    let result = solve_program("{ a; b; c } 1.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(model.len() <= 1);
+}
+
+#[test]
+fn choice_lower_bound() {
+    // 2 { a; b; c }. — at least 2 must be true
+    let result = solve_program("2 { a; b; c }.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(model.len() >= 2);
+}
+
+#[test]
+fn choice_exact_bound() {
+    // { a; b; c } = 1. — exactly 1 must be true
+    let result = solve_program("{ a; b; c } = 1.").unwrap();
+    let model = result.expect("expected SAT");
+    assert_eq!(model.len(), 1);
+}
+
+#[test]
+fn choice_exact_bound_two() {
+    // { a; b; c } = 2. — exactly 2 must be true
+    let result = solve_program("{ a; b; c } = 2.").unwrap();
+    let model = result.expect("expected SAT");
+    assert_eq!(model.len(), 2);
+}
+
+#[test]
+fn choice_bounds_unsat() {
+    // 3 { a; b } 2. — need at least 3 from 2 elements → UNSAT
+    assert_unsat("3 { a; b } 2.");
+}
+
+#[test]
+fn choice_bound_with_body() {
+    // 1 { b; c } 1 :- a. a. — exactly one of b,c when a is true
+    let result = solve_program("1 { b; c } 1 :- a. a.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(model.contains(&"a".to_string()));
+    let bc_count = model.iter().filter(|s| *s == "b" || *s == "c").count();
+    assert_eq!(bc_count, 1);
+}
+
+#[test]
+fn queens_4_with_cardinality() {
+    // 4-queens using = 1 syntax
+    let result = solve_program(
+        "row(1). row(2). row(3). row(4). col(1). col(2). col(3). col(4). \
+         {queen(R,C) : col(C)} = 1 :- row(R). \
+         :- queen(R1,C), queen(R2,C), R1 != R2. \
+         :- queen(R1,C1), queen(R2,C2), R1 != R2, R1-C1 = R2-C2. \
+         :- queen(R1,C1), queen(R2,C2), R1 != R2, R1+C1 = R2+C2. \
+         #show queen/2."
+    ).unwrap();
+    let model = result.expect("expected SAT");
+    assert_eq!(model.len(), 4); // exactly 4 queens
+}
+
+#[test]
+fn choice_upper_zero() {
+    // { a; b } 0. — nothing can be true
+    assert_sat("{ a; b } 0.", &[]);
+}
+
+#[test]
+fn self_join_original() {
+    assert_sat(
+        "p(1,2). p(2,3). q(X,Z) :- p(X,Y), p(Y,Z).",
+        &["p(1,2)", "p(2,3)", "q(1,3)"],
+    );
+}

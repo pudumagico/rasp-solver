@@ -125,10 +125,15 @@ impl<'a> Parser<'a> {
         self.expect(&Token::LBrace)?;
         let elements = self.parse_choice_elements()?;
         self.expect(&Token::RBrace)?;
-        let upper = if matches!(self.current, Token::Number(_) | Token::Ident(_) | Token::Variable(_)) {
-            Some(self.parse_term()?)
+        // Parse upper bound: `} N`, `} = N` (equality sets both lower and upper)
+        let (lower, upper) = if self.current == Token::Eq {
+            self.advance()?;
+            let bound = self.parse_term()?;
+            (Some(bound.clone()), Some(bound))
+        } else if matches!(self.current, Token::Number(_) | Token::Ident(_) | Token::Variable(_)) {
+            (lower, Some(self.parse_term()?))
         } else {
-            None
+            (lower, None)
         };
         let body = if self.current == Token::If {
             self.advance()?;

@@ -57,7 +57,8 @@ pub fn instantiate_constraint(
     results
 }
 
-/// Instantiate a choice rule.
+/// Instantiate a choice rule. Expands conditional elements by iterating
+/// over all matching condition bindings.
 pub fn instantiate_choice(
     choice: &ast::ChoiceRule,
     facts: &FactStore,
@@ -69,12 +70,17 @@ pub fn instantiate_choice(
     enumerate_body(&choice.body, 0, &bindings, facts, facts, const_map, &mut |b| {
         let mut head_atoms = Vec::new();
         for elem in &choice.elements {
-            let mut elem_bindings = b.clone();
-            let cond_ok = ground_condition(&elem.condition, &mut elem_bindings, facts, const_map);
-            if cond_ok
-                && let Some(ga) = ground_atom(&elem.atom, &elem_bindings, const_map) {
+            if elem.condition.is_empty() {
+                // No condition — ground the atom directly
+                if let Some(ga) = ground_atom(&elem.atom, b, const_map) {
                     head_atoms.push(atom_table.get_or_insert(ga));
                 }
+            } else {
+                // Expand condition: enumerate all matching bindings
+                expand_choice_condition(
+                    &elem.atom, &elem.condition, b, facts, const_map, atom_table, &mut head_atoms,
+                );
+            }
         }
         if !head_atoms.is_empty() {
             let (body_pos, body_neg) = ground_body(&choice.body, b, atom_table, const_map);
@@ -219,6 +225,27 @@ fn ground_atom(atom: &ast::Atom, bindings: &Bindings, const_map: &HashMap<Symbol
     Some(GroundAtom { predicate: atom.predicate, args: args? })
 }
 
+/// Expand a choice element's condition by enumerating all matching bindings,
+/// producing one head atom per valid binding.
+fn expand_choice_condition(
+    atom: &ast::Atom,
+    condition: &[Literal],
+    base_bindings: &Bindings,
+    facts: &FactStore,
+    const_map: &HashMap<SymbolId, Value>,
+    atom_table: &mut AtomTable,
+    head_atoms: &mut Vec<AtomId>,
+) {
+    enumerate_body(condition, 0, base_bindings, facts, facts, const_map, &mut |b| {
+        if let Some(ga) = ground_atom(atom, b, const_map) {
+            let id = atom_table.get_or_insert(ga);
+            if !head_atoms.contains(&id) {
+                head_atoms.push(id);
+            }
+        }
+    });
+}
+
 fn ground_body(
     body: &[Literal],
     bindings: &Bindings,
@@ -241,38 +268,6 @@ fn ground_body(
     (pos, neg)
 }
 
-fn ground_condition(
-    condition: &[Literal],
-    bindings: &mut Bindings,
-    facts: &FactStore,
-    const_map: &HashMap<SymbolId, Value>,
-) -> bool {
-    for lit in condition {
-        match lit {
-            Literal::Pos(BodyAtom::Atom(atom)) => {
-                let Some(fact_tuples) = facts.get(&atom.predicate) else { return false; };
-                let found = fact_tuples.iter().any(|tuple| {
-                    if tuple.len() != atom.args.len() { return false; }
-                    let mut test = bindings.clone();
-                    unify_args(&atom.args, tuple, &mut test, const_map)
-                });
-                if !found { return false; }
-            }
-            Literal::Neg(BodyAtom::Atom(atom)) => {
-                if let Some(fact_tuples) = facts.get(&atom.predicate) {
-                    let found = fact_tuples.iter().any(|tuple| {
-                        if tuple.len() != atom.args.len() { return false; }
-                        let mut test = bindings.clone();
-                        unify_args(&atom.args, tuple, &mut test, const_map)
-                    });
-                    if found { return false; }
-                }
-            }
-            _ => {}
-        }
-    }
-    true
-}
 
 #[cfg(test)]
 mod tests {

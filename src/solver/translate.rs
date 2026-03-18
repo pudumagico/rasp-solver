@@ -39,6 +39,7 @@ pub fn translate(program: &GroundProgram) -> Translation {
             RuleHead::Constraint => {
                 // Integrity constraint: body must not all hold.
                 // Clause: ¬b1 ∨ ... ∨ ¬bn ∨ c1 ∨ ... ∨ cm
+                // Empty clause = unconditional constraint = UNSAT
                 let mut clause = Vec::new();
                 for &bp in &rule.body_pos {
                     clause.push(Lit::neg(bp));
@@ -46,9 +47,7 @@ pub fn translate(program: &GroundProgram) -> Translation {
                 for &bn in &rule.body_neg {
                     clause.push(Lit::pos(bn));
                 }
-                if !clause.is_empty() {
-                    clauses.push(clause);
-                }
+                clauses.push(clause);
             }
             RuleHead::Choice(atoms) => {
                 for &a in atoms {
