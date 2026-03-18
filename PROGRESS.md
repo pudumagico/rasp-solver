@@ -6,57 +6,78 @@
 - [x] `types.rs` — AtomId, SymbolId, Lit, Value
 - [x] `interner.rs` — arena-based string interning
 - [x] `ground/program.rs` — GroundProgram, AtomTable
-- [ ] CLAUDE.md for agent instructions
-- [ ] harness/ infrastructure
-- [ ] `cargo build` passes
-- [ ] `cargo clippy` clean
+- [x] CLAUDE.md for agent instructions
+- [x] `cargo build` passes
+- [x] `cargo clippy` clean
+- [x] Unit tests for types.rs and ground/program.rs
 
 ## Phase 1: Parser
-- [ ] 1a: Lexer + token enum
-- [ ] 1b: AST types (done — stub in place)
-- [ ] 1c: Recursive descent parser
+- [x] 1a: Lexer (full implementation, 15 tests)
+- [x] 1b: AST types (complete)
+- [x] 1c: Recursive descent parser (16 tests)
 
 ## Phase 2: Grounder
-- [ ] 2a: Ground types (done — stub in place)
-- [ ] 2b: Domain computation
-- [ ] 2c: SCC + stratification
-- [ ] 2d: Semi-naive evaluation
-- [ ] 2e: Rule instantiation
-- [ ] 2f: #count aggregate grounding
+- [x] 2a: Ground types
+- [x] 2b: Domain computation
+- [x] 2c: SCC + stratification (Tarjan's)
+- [x] 2d: Semi-naive evaluation
+- [x] 2e: Rule instantiation
+- [x] 2f: #count aggregate grounding (staircase encoding)
+- [x] Error types + #const support
+- [x] Domain-aware grounding (choice atoms visible to normal rules + constraints)
+- [x] Non-stratifiable programs supported
 
 ## Phase 3: CDCL Solver
-- [ ] 3a: Ground → nogood translation
-- [ ] 3b: Assignment + trail
-- [ ] 3c: Clause storage + watched literals
-- [ ] 3d: Unit propagation
-- [ ] 3e: Conflict analysis (first-UIP)
-- [ ] 3f: VSIDS heuristic
-- [ ] 3g: Restart policy
-- [ ] 3h: Main CDCL loop
+- [x] 3a: Ground → nogood translation (Clark's completion)
+- [x] 3b: Assignment + trail
+- [x] 3c: Clause storage + watched literals
+- [x] 3d: Unit propagation (BCP)
+- [x] 3e: Conflict analysis (first-UIP)
+- [x] 3f: VSIDS heuristic (binary max-heap + phase saving)
+- [x] 3g: Restart policy (Luby sequence)
+- [x] 3h: Main CDCL loop
 
 ## Phase 4: Unfounded Set Detection
-- [ ] Source pointer algorithm
-- [ ] Loop nogood generation
-- [ ] Integration with CDCL loop
-- [ ] Choice rule semantics
+- [x] Greatest unfounded set computation (fixpoint algorithm)
+- [x] Loop nogood generation
+- [x] Integration with CDCL loop
+- [x] Choice rule semantics (choice atoms excluded from UFS)
 
 ## Phase 5: Test Harness
-- [ ] Oracle comparison (vs clingo)
+- [x] Output formatting (ASP Competition format)
+- [x] End-to-end integration tests (70 tests)
+- [x] Oracle comparison script (`scripts/oracle_test.sh`)
+- [x] CI fast script (`scripts/ci_fast.sh`)
 - [ ] Fuzz test generator
-- [ ] 100 curated test programs
-- [ ] ci_fast.sh (<30s)
 
 ## Phase 6: ASP Competition Benchmarks
-- [ ] Download instances
-- [ ] Benchmark runner
-- [ ] Pipeline integration
+- [x] Benchmark instances (13 total: queens 4/8/12/16, pigeonhole 3/2/5/4/7/6/9/8, graph coloring 3/15/20 nodes, Hamiltonian, reachability, stable marriage)
+- [x] Benchmark runner + generators (`scripts/benchmark.sh`, `benchmarks/gen_*.py`)
+- [x] 12/13 benchmarks pass correctly (pigeonhole_9_8 inherently exponential for CDCL)
 
 ## Phase 7: Performance Optimization
-- [ ] Grounder: hash indexes, trie storage
-- [ ] Solver: clause GC, propagation optimization
-- [ ] System: arena allocators, LTO
+- [x] Grounder: HashSet-based duplicate detection (was O(n) Vec::contains)
+- [x] Grounder: duplicate rule elimination in fixpoint loop
+- [x] Grounder: domain-aware grounding (choice atoms visible to normal rules)
+- [x] Solver: targeted VSIDS reinsertion on backtrack (was O(n) full scan)
+- [x] Solver: learned clause GC (activity-based, triggered at restarts)
+- [x] Solver: clause activity decay
+- [ ] Grounder: first-argument hash index for fact lookup
+- [ ] System: arena allocators
 
-## Phase 8: Agent Team
-- [ ] Docker infrastructure
-- [ ] AGENT_PROMPT.md
-- [ ] Multi-agent synchronization
+## Benchmark Results (release build)
+| Instance        | Result | Time    |
+|-----------------|--------|---------|
+| queens_8        | SAT    | 11ms    |
+| queens_12       | SAT    | 18ms    |
+| queens_16       | SAT    | 37ms    |
+| pigeonhole_7_6  | UNSAT  | 88ms    |
+| graph_color_3   | SAT    | 9ms     |
+| hamiltonian     | SAT    | 8ms     |
+| reachability_20 | SAT    | 10ms    |
+
+## Current Stats
+- **143 tests** (73 unit + 70 integration), all passing
+- **0 clippy warnings**
+- **13 benchmark instances**, 12 solving correctly
+- Phases 0–7 substantially complete

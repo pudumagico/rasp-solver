@@ -18,7 +18,8 @@ fn main() {
         }
     };
 
-    let program = match asp_solver::parser::parse(&input) {
+    let mut interner = asp_solver::interner::Interner::new();
+    let program = match asp_solver::parser::parse(&input, &mut interner) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Parse error: {e}");
@@ -26,7 +27,13 @@ fn main() {
         }
     };
 
-    let ground = asp_solver::grounder::ground(&program);
+    let ground = match asp_solver::grounder::ground(&program, &mut interner) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Grounding error: {e}");
+            process::exit(1);
+        }
+    };
     let result = asp_solver::solver::solve(&ground);
-    asp_solver::output::print_result(&result, &ground);
+    asp_solver::output::print_result(&result, &ground, &interner);
 }

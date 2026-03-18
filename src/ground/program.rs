@@ -68,3 +68,36 @@ impl AtomTable {
         self.atoms.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atom_table_insert_and_resolve() {
+        let mut table = AtomTable::new();
+        let atom = GroundAtom { predicate: SymbolId(0), args: vec![Value::Int(1)] };
+        let id = table.get_or_insert(atom.clone());
+        assert_eq!(table.resolve(id), &atom);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn atom_table_dedup() {
+        let mut table = AtomTable::new();
+        let atom = GroundAtom { predicate: SymbolId(0), args: vec![Value::Sym(SymbolId(1))] };
+        let id1 = table.get_or_insert(atom.clone());
+        let id2 = table.get_or_insert(atom.clone());
+        assert_eq!(id1, id2);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn atom_table_get() {
+        let mut table = AtomTable::new();
+        let atom = GroundAtom { predicate: SymbolId(0), args: vec![] };
+        assert_eq!(table.get(&atom), None);
+        let id = table.get_or_insert(atom.clone());
+        assert_eq!(table.get(&atom), Some(id));
+    }
+}

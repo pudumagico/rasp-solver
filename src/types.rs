@@ -45,3 +45,33 @@ impl SymbolId {
         self.0 as usize
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lit_pos_neg() {
+        let a = AtomId(0);
+        let p = Lit::pos(a);
+        let n = Lit::neg(a);
+        assert!(p.positive);
+        assert!(!n.positive);
+        assert_eq!(p.atom, a);
+        assert_eq!(n.atom, a);
+    }
+
+    #[test]
+    fn lit_negate() {
+        let lit = Lit::pos(AtomId(1));
+        let neg = lit.negate();
+        assert!(!neg.positive);
+        assert_eq!(neg.negate(), lit);
+    }
+
+    #[test]
+    fn atom_symbol_index() {
+        assert_eq!(AtomId(42).index(), 42);
+        assert_eq!(SymbolId(7).index(), 7);
+    }
+}
