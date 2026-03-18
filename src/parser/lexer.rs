@@ -263,6 +263,8 @@ impl<'a> Lexer<'a> {
             "show" => Ok(Token::Show),
             "const" => Ok(Token::Const),
             "count" => Ok(Token::Count),
+            "minimize" | "minimise" => Ok(Token::Minimize),
+            "maximize" | "maximise" => Ok(Token::Maximize),
             _ => Err(self.error_at(start_line, start_col, &format!("unknown directive '#{word}'"))),
         }
     }

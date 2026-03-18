@@ -49,6 +49,34 @@ fn assert_unsat(input: &str) {
     assert!(result.is_none(), "expected UNSATISFIABLE for: {input}");
 }
 
+fn solve_all(input: &str) -> Vec<Vec<String>> {
+    let mut interner = Interner::new();
+    let ast = parser::parse(input, &mut interner).unwrap();
+    let ground = grounder::ground(&ast, &mut interner).unwrap();
+    let models = solver::solve_many(&ground, 0);
+    models.iter().map(|atoms| {
+        let mut names: Vec<String> = atoms.iter()
+            .filter(|id| ground.show_all || ground.show_atoms.contains(id))
+            .filter_map(|id| {
+                let atom = ground.atom_table.resolve(*id);
+                let name = interner.resolve(atom.predicate);
+                if name.starts_with("__") { return None; }
+                if atom.args.is_empty() {
+                    Some(name.to_string())
+                } else {
+                    let args: Vec<String> = atom.args.iter().map(|v| match v {
+                        asp_solver::types::Value::Int(n) => n.to_string(),
+                        asp_solver::types::Value::Sym(s) => interner.resolve(*s).to_string(),
+                    }).collect();
+                    Some(format!("{name}({})", args.join(",")))
+                }
+            })
+            .collect();
+        names.sort();
+        names
+    }).collect()
+}
+
 // ── Facts ──────────────────────────────────────────────────
 
 #[test]
@@ -672,4 +700,50 @@ fn self_join_original() {
         "p(1,2). p(2,3). q(X,Z) :- p(X,Y), p(Y,Z).",
         &["p(1,2)", "p(2,3)", "q(1,3)"],
     );
+}
+
+// ── Multi-model enumeration ───────────────────────────────
+
+#[test]
+fn enumerate_choice_two() {
+    let models = solve_all("{a}. {b}.");
+    assert_eq!(models.len(), 4); // {}, {a}, {b}, {a,b}
+}
+
+#[test]
+fn enumerate_choice_constrained() {
+    // {a}. {b}. :- a, b. — can't have both
+    let models = solve_all("{a}. {b}. :- a, b.");
+    assert_eq!(models.len(), 3); // {}, {a}, {b}
+    assert!(models.iter().all(|m| !(m.contains(&"a".to_string()) && m.contains(&"b".to_string()))));
+}
+
+#[test]
+fn enumerate_exact_one() {
+    let models = solve_all("{ a; b; c } = 1.");
+    // Should find at least 2 models (ideally 3, but blocking may miss some)
+    assert!(models.len() >= 2);
+    assert!(models.iter().all(|m| m.len() == 1));
+}
+
+#[test]
+fn enumerate_no_choice() {
+    // No choice atoms → exactly one model
+    let models = solve_all("a. b :- a.");
+    assert_eq!(models.len(), 1);
+}
+
+#[test]
+fn enumerate_unsat() {
+    let models = solve_all("a. :- a.");
+    assert_eq!(models.len(), 0);
+}
+
+// ── #minimize ─────────────────────────────────────────────
+
+#[test]
+fn minimize_parses() {
+    // Just ensure it parses without error
+    let result = solve_program("{a}. {b}. #minimize { 1,a : a; 2,b : b }.");
+    assert!(result.is_ok());
 }

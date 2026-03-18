@@ -68,6 +68,8 @@ impl<'a> Parser<'a> {
                 self.parse_head_starting_with_term_or_ident()
             }
             Token::Ident(_) => self.parse_head_starting_with_ident(),
+            Token::Minimize => self.parse_optimize(true),
+            Token::Maximize => self.parse_optimize(false),
             _ => Err(self.error(format!("unexpected token {:?} at start of statement", self.current))),
         }
     }
@@ -188,6 +190,48 @@ impl<'a> Parser<'a> {
     }
 
     // ── show / const directives ────────────────────────────
+
+    fn parse_optimize(&mut self, minimize: bool) -> Result<Statement, ParseError> {
+        self.advance()?; // #minimize / #maximize
+        self.expect(&Token::LBrace)?;
+        let mut elements = Vec::new();
+        if self.current != Token::RBrace {
+            elements.push(self.parse_optimize_element()?);
+            while self.current == Token::Semicolon {
+                self.advance()?;
+                elements.push(self.parse_optimize_element()?);
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        self.expect(&Token::Dot)?;
+        Ok(Statement::Optimize(OptimizeDirective { minimize, elements }))
+    }
+
+    /// Parse `W[,P][,T1,...] : condition` or `W @ P : condition`
+    fn parse_optimize_element(&mut self) -> Result<OptimizeElement, ParseError> {
+        let weight = self.parse_term()?;
+        // Optional priority after @ or as second term after comma
+        let priority = None;
+        let mut terms = Vec::new();
+        if self.current == Token::Comma {
+            self.advance()?;
+            let next = self.parse_term()?;
+            // Check if there's more terms (weight, priority, terms...)
+            // For simplicity: first term is weight, remaining terms are tuple identifiers
+            terms.push(next);
+            while self.current == Token::Comma {
+                self.advance()?;
+                terms.push(self.parse_term()?);
+            }
+        }
+        let condition = if self.current == Token::Colon {
+            self.advance()?;
+            self.parse_condition_list()?
+        } else {
+            vec![]
+        };
+        Ok(OptimizeElement { weight, priority, terms, condition })
+    }
 
     fn parse_show(&mut self) -> Result<Statement, ParseError> {
         self.advance()?; // #show

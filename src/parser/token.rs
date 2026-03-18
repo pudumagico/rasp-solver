@@ -46,6 +46,8 @@ pub enum Token {
     Show,
     Const,
     Count,
+    Minimize,
+    Maximize,
 
     // Special
     Eof,

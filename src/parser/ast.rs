@@ -13,6 +13,21 @@ pub enum Statement {
     Show(ShowDirective),
     ShowSig(ShowSigDirective),
     Const(ConstDef),
+    Optimize(OptimizeDirective),
+}
+
+#[derive(Debug, Clone)]
+pub struct OptimizeDirective {
+    pub minimize: bool,
+    pub elements: Vec<OptimizeElement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OptimizeElement {
+    pub weight: Term,
+    pub priority: Option<Term>,
+    pub terms: Vec<Term>,
+    pub condition: Vec<Literal>,
 }
 
 #[derive(Debug, Clone)]
