@@ -36,6 +36,25 @@ pub fn translate(program: &GroundProgram) -> Translation {
                 clause.push(Lit::pos(*head_id));
                 clauses.push(clause);
             }
+            RuleHead::Disjunction(atoms) => {
+                // Disjunctive rule: a | b | c :- body.
+                // If body holds, at least one head atom must be true.
+                // Clause: ¬b1 ∨ ... ∨ c1 ∨ ... ∨ a ∨ b ∨ c
+                for &a in atoms {
+                    support.entry(a).or_default().push(ri);
+                }
+                let mut clause = Vec::new();
+                for &bp in &rule.body_pos {
+                    clause.push(Lit::neg(bp));
+                }
+                for &bn in &rule.body_neg {
+                    clause.push(Lit::pos(bn));
+                }
+                for &a in atoms {
+                    clause.push(Lit::pos(a));
+                }
+                clauses.push(clause);
+            }
             RuleHead::Constraint => {
                 // Integrity constraint: body must not all hold.
                 // Clause: ¬b1 ∨ ... ∨ ¬bn ∨ c1 ∨ ... ∨ cm

@@ -51,16 +51,17 @@ pub fn evaluate(
         }
     }
 
-    // Collect initial facts
+    // Collect initial facts (rules with empty body and single head atom)
     for stmt in &program.statements {
         if let Statement::Rule(r) = stmt
-            && r.body.is_empty() {
-                let args: Option<Vec<Value>> = r.head.args.iter()
+            && r.body.is_empty() && r.head.len() == 1 {
+                let h = &r.head[0];
+                let args: Option<Vec<Value>> = h.args.iter()
                     .map(|t| instantiate::eval_term(t, &HashMap::new(), const_map))
                     .collect();
                 if let Some(args) = args
-                    && add_to_both(r.head.predicate, args.clone(), &mut facts, &mut known) {
-                        let ga = GroundAtom { predicate: r.head.predicate, args };
+                    && add_to_both(h.predicate, args.clone(), &mut facts, &mut known) {
+                        let ga = GroundAtom { predicate: h.predicate, args };
                         let id = atom_table.get_or_insert(ga);
                         all_rules.push(GroundRule { head: RuleHead::Normal(id), body_pos: vec![], body_neg: vec![] });
                     }
@@ -110,10 +111,10 @@ fn evaluate_stratum(
 
     for &ri in &stratum.rule_indices {
         match &program.statements[ri] {
-            Statement::Rule(r) if !r.body.is_empty() => normal_rules.push(r),
+            Statement::Rule(r) if !r.body.is_empty() || r.head.len() > 1 => normal_rules.push(r),
             Statement::Constraint(c) => constraints.push(c),
             Statement::Choice(ch) => choices.push(ch),
-            _ => {}
+            _ => {} // single-head facts already collected
         }
     }
 
@@ -160,7 +161,12 @@ fn evaluate_stratum(
                 let key = rule_key(&gr);
                 if !seen_rules.insert(key) { continue; }
 
-                if let RuleHead::Normal(head_id) = gr.head {
+                let head_ids = match &gr.head {
+                    RuleHead::Normal(id) => vec![*id],
+                    RuleHead::Disjunction(ids) => ids.clone(),
+                    _ => vec![],
+                };
+                for head_id in head_ids {
                     let head_atom = atom_table.resolve(head_id);
                     let pred = head_atom.predicate;
                     let args = head_atom.args.clone();
@@ -272,12 +278,17 @@ pub fn dedup_rules(rules: &mut Vec<GroundRule>) {
 fn rule_key(r: &GroundRule) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let head = match &r.head {
         RuleHead::Normal(id) => vec![0, id.0],
-        RuleHead::Choice(ids) => {
+        RuleHead::Disjunction(ids) => {
             let mut v = vec![1];
             v.extend(ids.iter().map(|id| id.0));
             v
         }
-        RuleHead::Constraint => vec![2],
+        RuleHead::Choice(ids) => {
+            let mut v = vec![2];
+            v.extend(ids.iter().map(|id| id.0));
+            v
+        }
+        RuleHead::Constraint => vec![3],
     };
     let pos: Vec<u32> = r.body_pos.iter().map(|id| id.0).collect();
     let neg: Vec<u32> = r.body_neg.iter().map(|id| id.0).collect();

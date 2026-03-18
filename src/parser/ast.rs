@@ -17,7 +17,8 @@ pub enum Statement {
 
 #[derive(Debug, Clone)]
 pub struct Rule {
-    pub head: Atom,
+    /// Disjunctive head: `a | b | c :- body.` — single atom for normal rules.
+    pub head: Vec<Atom>,
     pub body: Vec<Literal>,
 }
 

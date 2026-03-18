@@ -16,7 +16,9 @@ impl DomainMap {
         for stmt in &program.statements {
             match stmt {
                 Statement::Rule(r) => {
-                    collect_atom_domains(&r.head, const_map, &mut domains, &mut universe);
+                    for h in &r.head {
+                        collect_atom_domains(h, const_map, &mut domains, &mut universe);
+                    }
                     for lit in &r.body {
                         collect_literal_domains(lit, const_map, &mut domains, &mut universe);
                     }

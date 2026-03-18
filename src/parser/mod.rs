@@ -83,29 +83,41 @@ impl<'a> Parser<'a> {
 
     // ── head disambiguation ────────────────────────────────
 
-    /// Statement starts with an identifier — could be a fact, rule, or choice head.
+    /// Statement starts with an identifier — could be a fact, rule, disjunctive rule, or choice head.
     fn parse_head_starting_with_ident(&mut self) -> Result<Statement, ParseError> {
         let atom = self.parse_atom()?;
         match &self.current {
             Token::Dot => {
-                // fact
                 self.advance()?;
-                Ok(Statement::Rule(Rule { head: atom, body: vec![] }))
+                Ok(Statement::Rule(Rule { head: vec![atom], body: vec![] }))
             }
             Token::If => {
-                // rule with body
                 self.advance()?;
                 let body = self.parse_body()?;
                 self.expect(&Token::Dot)?;
-                Ok(Statement::Rule(Rule { head: atom, body }))
+                Ok(Statement::Rule(Rule { head: vec![atom], body }))
+            }
+            Token::Pipe => {
+                // Disjunctive head: a | b | c ...
+                let mut heads = vec![atom];
+                while self.current == Token::Pipe {
+                    self.advance()?;
+                    heads.push(self.parse_atom()?);
+                }
+                let body = if self.current == Token::If {
+                    self.advance()?;
+                    self.parse_body()?
+                } else {
+                    vec![]
+                };
+                self.expect(&Token::Dot)?;
+                Ok(Statement::Rule(Rule { head: heads, body }))
             }
             Token::LBrace => {
-                // This ident was actually a choice lower bound term — but that only works if
-                // the atom was a bare symbolic constant (no args). Reinterpret as term.
                 let lower = Some(Term::Symbolic(atom.predicate));
                 self.parse_choice_statement(lower)
             }
-            _ => Err(self.error(format!("expected '.', ':-', or '{{' after head atom, got {:?}", self.current))),
+            _ => Err(self.error(format!("expected '.', ':-', '|', or '{{' after head atom, got {:?}", self.current))),
         }
     }
 
@@ -539,7 +551,7 @@ mod tests {
     fn fact_with_args() {
         let prog = parse_ok("p(1, 2).");
         let Statement::Rule(r) = &prog.statements[0] else { panic!() };
-        assert_eq!(r.head.args.len(), 2);
+        assert_eq!(r.head[0].args.len(), 2);
     }
 
     #[test]
@@ -582,7 +594,7 @@ mod tests {
     fn arithmetic() {
         let prog = parse_ok("p(X+1) :- q(X).");
         let Statement::Rule(r) = &prog.statements[0] else { panic!() };
-        assert!(matches!(&r.head.args[0], Term::BinOp(BinOp::Add, _, _)));
+        assert!(matches!(&r.head[0].args[0], Term::BinOp(BinOp::Add, _, _)));
     }
 
     #[test]

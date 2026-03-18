@@ -550,6 +550,51 @@ fn self_join() {
     );
 }
 
+// ── Disjunctive heads ─────────────────────────────────────
+
+#[test]
+fn disjunction_simple() {
+    // a | b. — at least one must be true
+    let result = solve_program("a | b.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(!model.is_empty());
+    assert!(model.contains(&"a".to_string()) || model.contains(&"b".to_string()));
+}
+
+#[test]
+fn disjunction_with_body() {
+    // a | b :- c. c. — c is true, so at least one of a, b
+    let result = solve_program("a | b :- c. c.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(model.contains(&"c".to_string()));
+    assert!(model.contains(&"a".to_string()) || model.contains(&"b".to_string()));
+}
+
+#[test]
+fn disjunction_three_way() {
+    let result = solve_program("a | b | c.").unwrap();
+    let model = result.expect("expected SAT");
+    assert!(!model.is_empty());
+}
+
+#[test]
+fn disjunction_with_constraint() {
+    // a | b. :- a. — a can't be true → b must be true
+    assert_sat("a | b. :- a.", &["b"]);
+}
+
+#[test]
+fn disjunction_coloring() {
+    // Simple 2-coloring of a 2-node graph using disjunction
+    let result = solve_program(
+        "red(1) | blue(1). red(2) | blue(2). \
+         :- red(1), red(2). :- blue(1), blue(2)."
+    ).unwrap();
+    let model = result.expect("expected SAT");
+    // Nodes should have different colors
+    assert_eq!(model.len(), 2);
+}
+
 // ── Cardinality bounds ────────────────────────────────────
 
 #[test]

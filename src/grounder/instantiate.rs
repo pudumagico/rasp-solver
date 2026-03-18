@@ -7,20 +7,9 @@ use crate::types::{AtomId, SymbolId, Value};
 pub type Bindings = HashMap<SymbolId, Value>;
 pub type FactStore = HashMap<SymbolId, Vec<Vec<Value>>>;
 
-/// Instantiate a rule using `facts` for both positive and NAF matching.
-pub fn instantiate_rule(
-    head: &ast::Atom,
-    body: &[Literal],
-    facts: &FactStore,
-    atom_table: &mut AtomTable,
-    const_map: &HashMap<SymbolId, Value>,
-) -> Vec<GroundRule> {
-    instantiate_rule_with_domain(head, body, facts, facts, atom_table, const_map)
-}
-
-/// Instantiate a rule using `domain` for positive matching and `facts` for NAF.
+/// Instantiate a rule (possibly disjunctive) using `domain` for positive matching.
 pub fn instantiate_rule_with_domain(
-    head: &ast::Atom,
+    heads: &[ast::Atom],
     body: &[Literal],
     facts: &FactStore,
     domain: &FactStore,
@@ -30,11 +19,18 @@ pub fn instantiate_rule_with_domain(
     let mut results = Vec::new();
     let bindings = Bindings::new();
     enumerate_body(body, 0, &bindings, domain, facts, const_map, &mut |b| {
-        if let Some(ground_head) = ground_atom(head, b, const_map) {
-            let head_id = atom_table.get_or_insert(ground_head);
-            let (body_pos, body_neg) = ground_body(body, b, atom_table, const_map);
-            results.push(GroundRule { head: RuleHead::Normal(head_id), body_pos, body_neg });
-        }
+        let ground_heads: Vec<AtomId> = heads.iter()
+            .filter_map(|h| ground_atom(h, b, const_map))
+            .map(|ga| atom_table.get_or_insert(ga))
+            .collect();
+        if ground_heads.is_empty() { return; }
+        let (body_pos, body_neg) = ground_body(body, b, atom_table, const_map);
+        let head = if ground_heads.len() == 1 {
+            RuleHead::Normal(ground_heads[0])
+        } else {
+            RuleHead::Disjunction(ground_heads)
+        };
+        results.push(GroundRule { head, body_pos, body_neg });
     });
     results
 }
@@ -285,7 +281,7 @@ mod tests {
         facts.insert(a_id, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
 
         let ast::Statement::Rule(rule) = &prog.statements[2] else { panic!() };
-        let rules = instantiate_rule(&rule.head, &rule.body, &facts, &mut atom_table, &HashMap::new());
+        let rules = instantiate_rule_with_domain(&rule.head, &rule.body, &facts, &facts, &mut atom_table, &HashMap::new());
         assert_eq!(rules.len(), 2);
     }
 

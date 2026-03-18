@@ -18,6 +18,7 @@ pub struct GroundRule {
 #[derive(Debug, Clone)]
 pub enum RuleHead {
     Normal(AtomId),
+    Disjunction(Vec<AtomId>),
     Choice(Vec<AtomId>),
     Constraint,
 }

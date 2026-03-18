@@ -25,15 +25,18 @@ pub fn stratify(program: &ast::Program) -> Result<Vec<Stratum>, String> {
     }
     let mut strata: Vec<Stratum> = sccs.into_iter().map(|s| Stratum { predicates: s.predicates, rule_indices: Vec::new() }).collect();
     for (i, stmt) in program.statements.iter().enumerate() {
-        let head_pred = match stmt {
-            Statement::Rule(r) => Some(r.head.predicate),
-            Statement::Choice(ch) => ch.elements.first().map(|e| e.atom.predicate),
-            Statement::Constraint(_) => None,
+        let head_preds: Vec<SymbolId> = match stmt {
+            Statement::Rule(r) => r.head.iter().map(|a| a.predicate).collect(),
+            Statement::Choice(ch) => ch.elements.first().map(|e| vec![e.atom.predicate]).unwrap_or_default(),
+            Statement::Constraint(_) => vec![],
             _ => continue,
         };
-        if let Some(pred) = head_pred {
-            if let Some(&si) = pred_to_stratum.get(&pred) {
-                strata[si].rule_indices.push(i);
+        if !head_preds.is_empty() {
+            for pred in &head_preds {
+                if let Some(&si) = pred_to_stratum.get(pred) {
+                    strata[si].rule_indices.push(i);
+                    break; // assign rule to first head predicate's stratum
+                }
             }
         } else if matches!(stmt, Statement::Constraint(_)) {
             // Constraints go in the last stratum
@@ -55,9 +58,10 @@ fn build_dep_graph(program: &ast::Program) -> (HashSet<SymbolId>, DepEdges) {
     for stmt in &program.statements {
         match stmt {
             Statement::Rule(r) => {
-                let head = r.head.predicate;
-                nodes.insert(head);
-                add_body_edges(head, &r.body, &mut nodes, &mut edges);
+                for h in &r.head {
+                    nodes.insert(h.predicate);
+                    add_body_edges(h.predicate, &r.body, &mut nodes, &mut edges);
+                }
             }
             Statement::Choice(ch) => {
                 for elem in &ch.elements {

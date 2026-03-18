@@ -31,7 +31,7 @@ impl UnfoundedSetChecker {
         for (ri, rule) in program.rules.iter().enumerate() {
             let heads: Vec<AtomId> = match &rule.head {
                 RuleHead::Normal(a) => vec![*a],
-                RuleHead::Choice(atoms) => atoms.clone(),
+                RuleHead::Disjunction(atoms) | RuleHead::Choice(atoms) => atoms.clone(),
                 RuleHead::Constraint => vec![],
             };
             for &h in &heads {
