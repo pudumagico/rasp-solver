@@ -105,8 +105,14 @@ fn enumerate_body(
     match &body[idx] {
         Literal::Pos(BodyAtom::Atom(atom)) => {
             let Some(tuples) = pos_domain.get(&atom.predicate) else { return; };
+            // Optimization: if first arg is ground, skip non-matching tuples early
+            let first_ground = atom.args.first().and_then(|t| eval_term(t, bindings, const_map));
             for tuple in tuples {
                 if tuple.len() != atom.args.len() { continue; }
+                // Fast filter: check first argument before full unification
+                if let Some(ref fv) = first_ground
+                    && let Some(tv) = tuple.first()
+                    && fv != tv { continue; }
                 let mut new_bindings = bindings.clone();
                 if unify_args(&atom.args, tuple, &mut new_bindings, const_map) {
                     enumerate_body(body, idx + 1, &new_bindings, pos_domain, naf_facts, const_map, callback);
