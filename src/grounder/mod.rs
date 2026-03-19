@@ -31,25 +31,90 @@ pub fn ground(program: &Program, interner: &mut Interner) -> Result<GroundProgra
 }
 
 /// Expand range terms (pools) like `p(1..3)` into multiple statements.
+/// Handles facts, rules, constraints, and choice rules.
 fn expand_pools(program: &Program, const_map: &HashMap<SymbolId, Value>) -> Program {
     let mut stmts = Vec::new();
     for stmt in &program.statements {
         match stmt {
             Statement::Rule(r) => {
-                // Expand ranges in head atoms of facts (empty body)
-                if r.body.is_empty() {
-                    let expanded_heads = expand_atom_list_ranges(&r.head, const_map);
-                    for heads in expanded_heads {
-                        stmts.push(Statement::Rule(ast::Rule { head: heads, body: r.body.clone() }));
+                let expanded_heads = expand_atom_list_ranges(&r.head, const_map);
+                let expanded_bodies = expand_body_ranges(&r.body, const_map);
+                for heads in &expanded_heads {
+                    for body in &expanded_bodies {
+                        stmts.push(Statement::Rule(ast::Rule { head: heads.clone(), body: body.clone() }));
                     }
-                } else {
-                    stmts.push(stmt.clone());
+                }
+            }
+            Statement::Constraint(c) => {
+                let expanded_bodies = expand_body_ranges(&c.body, const_map);
+                for body in expanded_bodies {
+                    stmts.push(Statement::Constraint(ast::Constraint { body }));
+                }
+            }
+            Statement::Choice(ch) => {
+                // Expand ranges in choice element atoms and body
+                let expanded_bodies = expand_body_ranges(&ch.body, const_map);
+                let expanded_elems = expand_choice_elements(&ch.elements, const_map);
+                for body in &expanded_bodies {
+                    stmts.push(Statement::Choice(ast::ChoiceRule {
+                        lower: ch.lower.clone(),
+                        upper: ch.upper.clone(),
+                        elements: expanded_elems.clone(),
+                        body: body.clone(),
+                    }));
                 }
             }
             _ => stmts.push(stmt.clone()),
         }
     }
     Program { statements: stmts }
+}
+
+/// Expand ranges in body literals.
+fn expand_body_ranges(body: &[ast::Literal], const_map: &HashMap<SymbolId, Value>) -> Vec<Vec<ast::Literal>> {
+    let mut result = vec![Vec::new()];
+    for lit in body {
+        let expanded = expand_literal_ranges(lit, const_map);
+        let mut new_result = Vec::new();
+        for existing in &result {
+            for exp in &expanded {
+                let mut combined = existing.clone();
+                combined.push(exp.clone());
+                new_result.push(combined);
+            }
+        }
+        result = new_result;
+    }
+    result
+}
+
+/// Expand ranges within a single literal.
+fn expand_literal_ranges(lit: &ast::Literal, const_map: &HashMap<SymbolId, Value>) -> Vec<ast::Literal> {
+    match lit {
+        ast::Literal::Pos(ast::BodyAtom::Atom(a)) => {
+            expand_atom_ranges(a, const_map).into_iter()
+                .map(|ea| ast::Literal::Pos(ast::BodyAtom::Atom(ea)))
+                .collect()
+        }
+        ast::Literal::Neg(ast::BodyAtom::Atom(a)) => {
+            expand_atom_ranges(a, const_map).into_iter()
+                .map(|ea| ast::Literal::Neg(ast::BodyAtom::Atom(ea)))
+                .collect()
+        }
+        _ => vec![lit.clone()],
+    }
+}
+
+/// Expand ranges in choice elements.
+fn expand_choice_elements(elems: &[ast::ChoiceElement], const_map: &HashMap<SymbolId, Value>) -> Vec<ast::ChoiceElement> {
+    let mut result = Vec::new();
+    for elem in elems {
+        let expanded_atoms = expand_atom_ranges(&elem.atom, const_map);
+        for ea in expanded_atoms {
+            result.push(ast::ChoiceElement { atom: ea, condition: elem.condition.clone() });
+        }
+    }
+    result
 }
 
 /// Expand ranges in a list of atoms. Returns all combinations.

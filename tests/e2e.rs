@@ -741,7 +741,6 @@ fn enumerate_unsat() {
 
 // ── #minimize ─────────────────────────────────────────────
 
-#[test]
 // ── Pools (range expansion) ───────────────────────────────
 
 #[test]
@@ -775,7 +774,30 @@ fn pool_in_program() {
 
 #[test]
 fn minimize_parses() {
-    // Just ensure it parses without error
     let result = solve_program("{a}. {b}. #minimize { 1,a : a; 2,b : b }.");
     assert!(result.is_ok());
+}
+
+#[test]
+fn sum_aggregate_parses() {
+    let result = solve_program("val(1). val(2). val(3). :- #sum { X : val(X) } > 10.");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn pool_in_rule_body() {
+    // num(1..3) expands; rule uses them
+    assert_sat(
+        "num(1..5). double(X*2) :- num(X).",
+        &["double(10)", "double(2)", "double(4)", "double(6)", "double(8)",
+          "num(1)", "num(2)", "num(3)", "num(4)", "num(5)"],
+    );
+}
+
+#[test]
+fn pool_in_choice() {
+    // Choice with pool elements
+    let result = solve_program("{sel(1..3)}. :- not sel(1), not sel(2), not sel(3).");
+    let model = result.unwrap().expect("SAT");
+    assert!(!model.is_empty());
 }

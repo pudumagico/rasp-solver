@@ -50,8 +50,8 @@ fn main() {
         }
     };
 
-    // Check for optimization directives
-    let has_optimize = program.statements.iter().any(|s| matches!(s, asp_solver::parser::ast::Statement::Optimize(_)));
+    let has_optimize = program.statements.iter()
+        .any(|s| matches!(s, asp_solver::parser::ast::Statement::Optimize(_)));
 
     let ground = match asp_solver::grounder::ground(&program, &mut interner) {
         Ok(g) => g,
@@ -62,7 +62,6 @@ fn main() {
     };
 
     if has_optimize {
-        // Optimization mode: find optimal answer set
         let opt_specs = asp_solver::grounder::ground_optimize(&program, &ground, &interner);
         solve_optimize(&ground, &interner, &opt_specs);
     } else if num_models == 1 {
@@ -75,13 +74,26 @@ fn main() {
         } else {
             for (i, model) in models.iter().enumerate() {
                 let result = asp_solver::solver::SolveResult::Satisfiable(model.clone());
-                if models.len() > 1 {
-                    println!("Answer: {}", i + 1);
-                }
+                if models.len() > 1 { println!("Answer: {}", i + 1); }
                 asp_solver::output::print_result(&result, &ground, &interner);
             }
         }
     }
+}
+
+fn compute_cost(
+    model: &[asp_solver::types::AtomId],
+    opt_specs: &[(Vec<(i64, asp_solver::types::AtomId)>, bool)],
+) -> i64 {
+    let mut total = 0i64;
+    for (weights, minimize) in opt_specs {
+        let cost: i64 = weights.iter()
+            .filter(|(_, atom)| model.contains(atom))
+            .map(|(w, _)| *w)
+            .sum();
+        total += if *minimize { cost } else { -cost };
+    }
+    total
 }
 
 fn solve_optimize(
@@ -89,27 +101,27 @@ fn solve_optimize(
     interner: &asp_solver::interner::Interner,
     opt_specs: &[(Vec<(i64, asp_solver::types::AtomId)>, bool)],
 ) {
-    use asp_solver::solver::{SolveResult, solve};
-    
+    use asp_solver::solver::SolveResult;
 
-    // Iterative optimization: find a model, then constrain cost to be strictly better
-    let best_result = solve(ground);
-    let SolveResult::Satisfiable(ref best_model) = best_result else {
+    // Iterative optimization: enumerate models, track best cost
+    let models = asp_solver::solver::solve_many(ground, 0);
+    if models.is_empty() {
         println!("UNSATISFIABLE");
         return;
-    };
-
-    // For now, just print the first answer set with its cost
-    // Full iterative optimization would require adding clauses to the ground program
-    // and re-solving, which needs a mutable solver interface.
-    let mut total_cost = 0i64;
-    for (weights, minimize) in opt_specs {
-        let cost: i64 = weights.iter()
-            .filter(|(_, atom)| best_model.contains(atom))
-            .map(|(w, _)| *w)
-            .sum();
-        total_cost += if *minimize { cost } else { -cost };
     }
-    asp_solver::output::print_result(&best_result, ground, interner);
-    println!("Optimization: {total_cost}");
+
+    let mut best_model = &models[0];
+    let mut best_cost = compute_cost(best_model, opt_specs);
+
+    for model in &models[1..] {
+        let cost = compute_cost(model, opt_specs);
+        if cost < best_cost {
+            best_cost = cost;
+            best_model = model;
+        }
+    }
+
+    let result = SolveResult::Satisfiable(best_model.clone());
+    asp_solver::output::print_result(&result, ground, interner);
+    println!("Optimization: {best_cost}");
 }
