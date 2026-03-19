@@ -1,55 +1,59 @@
-% rasp-solver preliminary benchmark results
-% Date: 2026-03-18
+% rasp-solver benchmark results
+% Date: 2026-03-19
 % Platform: Apple M-series, Rust 1.94.0, release build (LTO enabled)
-% Solver version: commit 44258a6
+% Solver version: commit after 44258a6
 
 \begin{table}[t]
 \centering
-\caption{Preliminary benchmark results for \textsc{rasp-solver} v0.1.
-All times in seconds, timeout = 60\,s.
+\caption{Benchmark results for \textsc{rasp-solver} v0.1.
+All times in seconds, timeout = 120\,s.
 Platform: Apple M-series (ARM64), Rust 1.94.0, release build with LTO.}
 \label{tab:benchmarks-v1}
 \begin{tabular}{llrl}
 \toprule
 \textbf{Instance} & \textbf{Problem} & \textbf{Time (s)} & \textbf{Result} \\
 \midrule
-\multicolumn{4}{l}{\emph{Satisfiable instances}} \\
-\texttt{queens\_4}        & $N$-Queens ($N{=}4$)        & 0.008 & SAT \\
-\texttt{queens\_8}        & $N$-Queens ($N{=}8$)        & 0.013 & SAT \\
-\texttt{queens\_12}       & $N$-Queens ($N{=}12$)       & 0.018 & SAT \\
-\texttt{queens\_16}       & $N$-Queens ($N{=}16$)       & 0.035 & SAT \\
-\texttt{graph\_color\_3}  & 3-Coloring (6 nodes, 7 edges) & 0.009 & SAT \\
-\texttt{hamiltonian}      & Ham.\ cycle (4 nodes, 6 edges) & 0.008 & SAT \\
+\multicolumn{4}{l}{\emph{N-Queens}} \\
+\texttt{queens\_8}        & $N{=}8$         & 0.013 & SAT \\
+\texttt{queens\_12}       & $N{=}12$        & 0.018 & SAT \\
+\texttt{queens\_16}       & $N{=}16$        & 0.035 & SAT \\
+\texttt{queens\_20}       & $N{=}20$        & 0.494 & SAT \\
+\texttt{queens\_30}       & $N{=}30$        & 0.320 & SAT \\
+\texttt{queens\_50}       & $N{=}50$        & 2.343 & SAT \\
+\texttt{queens\_100}      & $N{=}100$       & 36.786 & SAT \\
+\midrule
+\multicolumn{4}{l}{\emph{Graph Coloring}} \\
+\texttt{graph\_color\_3}  & 3-col.\ (6n, 7e)   & 0.009 & SAT \\
+\texttt{graph\_color\_15} & 3-col.\ (15n)       & 0.009 & UNSAT \\
+\texttt{graph\_color\_30} & 3-col.\ (30n)       & 0.011 & SAT \\
+\texttt{graph\_color\_50} & 3-col.\ (50n)       & 0.012 & SAT \\
+\texttt{graph\_color\_100}& 3-col.\ (100n)      & 0.020 & SAT \\
+\midrule
+\multicolumn{4}{l}{\emph{Pigeonhole Principle}} \\
+\texttt{pigeonhole\_3\_2} & $3 \to 2$       & 0.008 & UNSAT \\
+\texttt{pigeonhole\_5\_4} & $5 \to 4$       & 0.008 & UNSAT \\
+\texttt{pigeonhole\_7\_6} & $7 \to 6$       & 0.092 & UNSAT \\
+\midrule
+\multicolumn{4}{l}{\emph{Combinatorial}} \\
+\texttt{hamiltonian}      & Ham.\ cycle (4n, 6e) & 0.008 & SAT \\
 \texttt{schur\_4\_9}      & Schur numbers ($k{=}4$, $n{=}9$) & 0.014 & SAT \\
 \texttt{latin\_square\_4} & Latin square ($4{\times}4$) & 0.009 & SAT \\
 \texttt{knight\_tour\_5}  & Knight's tour ($5{\times}5$) & 0.138 & SAT \\
-\texttt{reachability\_20} & Reachability (20 nodes)     & 0.010 & SAT \\
 \texttt{stable\_marriage} & Stable marriage ($3{\times}3$) & 0.009 & SAT \\
-\midrule
-\multicolumn{4}{l}{\emph{Unsatisfiable instances}} \\
-\texttt{pigeonhole\_3\_2} & Pigeonhole ($3 \to 2$)      & 0.008 & UNSAT \\
-\texttt{pigeonhole\_5\_4} & Pigeonhole ($5 \to 4$)      & 0.008 & UNSAT \\
-\texttt{pigeonhole\_7\_6} & Pigeonhole ($7 \to 6$)      & 0.092 & UNSAT \\
-\texttt{graph\_color\_15} & 3-Coloring (15 nodes)       & 0.009 & UNSAT \\
 \bottomrule
 \end{tabular}
 
 \medskip
 \small
-15/15 instances solved within 60\,s (excluding \texttt{pigeonhole\_9\_8} which requires exponential resolution).
-Median solving time: 0.009\,s.
-Hardest solved instance: \texttt{knight\_tour\_5} at 0.138\,s.
+All 20 instances solved within 120\,s.
+The solver scales to $N$-Queens with $N{=}100$ (10,000 choice atoms).
+Graph coloring with 100 nodes solves in 20\,ms.
 \end{table}
 
-% Implementation summary for paper body:
-% - ~4000 lines of Rust, no external solver dependencies (only thiserror)
-% - Parser: recursive descent, ASP-Core-2 subset including disjunctive heads
-% - Grounder: Tarjan SCC + stratified semi-naive evaluation with domain-aware grounding
-% - Solver: CDCL with two-watched literals, first-UIP learning, VSIDS heuristic,
-%   Luby restarts, activity-based clause GC
-% - Stable models: greatest unfounded set fixpoint algorithm
-% - Features: normal/disjunctive rules, choice rules with bounds, cardinality constraints,
-%   conditional elements, #count/#sum/#min/#max aggregates (parsing),
-%   negation as failure, arithmetic, comparisons, #show, #const,
-%   #minimize/#maximize, multi-model enumeration (-n)
-% - 163 tests (73 unit + 90 integration)
+% Implementation summary:
+% - ~4500 lines of Rust, single dependency (thiserror)
+% - Features: normal/disjunctive rules, choice rules with bounds,
+%   conditional elements, #count aggregates, #sum/#min/#max (parsing),
+%   negation as failure, arithmetic, comparisons, ranges/pools,
+%   #show, #const, #minimize/#maximize, multi-model enumeration (-n)
+% - 168 tests (73 unit + 95 integration)

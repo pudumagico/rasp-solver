@@ -742,6 +742,38 @@ fn enumerate_unsat() {
 // ── #minimize ─────────────────────────────────────────────
 
 #[test]
+// ── Pools (range expansion) ───────────────────────────────
+
+#[test]
+fn pool_simple() {
+    assert_sat("p(1..3).", &["p(1)", "p(2)", "p(3)"]);
+}
+
+#[test]
+fn pool_two_args() {
+    // p(1..2, a) → p(1,a), p(2,a)
+    assert_sat("p(1..2, a).", &["p(1,a)", "p(2,a)"]);
+}
+
+#[test]
+fn pool_multi_range() {
+    // p(1..2, 1..2) → p(1,1), p(1,2), p(2,1), p(2,2)
+    let result = solve_program("p(1..2, 1..2).").unwrap();
+    let model = result.expect("SAT");
+    assert_eq!(model.len(), 4);
+}
+
+#[test]
+fn pool_in_program() {
+    assert_sat(
+        "num(1..5). big(X) :- num(X), X > 3.",
+        &["big(4)", "big(5)", "num(1)", "num(2)", "num(3)", "num(4)", "num(5)"],
+    );
+}
+
+// ── #minimize ─────────────────────────────────────────────
+
+#[test]
 fn minimize_parses() {
     // Just ensure it parses without error
     let result = solve_program("{a}. {b}. #minimize { 1,a : a; 2,b : b }.");
