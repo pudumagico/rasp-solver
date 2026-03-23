@@ -67,6 +67,8 @@ pub enum BodyAtom {
     Atom(Atom),
     Comparison(Comparison),
     Aggregate(Aggregate),
+    /// Conditional literal: `p(X) : q(X), r(X)` — conjunction over condition domain.
+    CondLiteral(Atom, Vec<Literal>),
 }
 
 #[derive(Debug, Clone)]

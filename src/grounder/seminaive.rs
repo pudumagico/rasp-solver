@@ -5,7 +5,7 @@ use crate::interner::Interner;
 use crate::parser::ast::{self, Statement, Term};
 use crate::types::{AtomId, SymbolId, Value};
 
-use super::instantiate::{self, FactStore};
+use super::instantiate::{self, AggContext, FactStore};
 use super::scc::Stratum;
 
 /// Fast lookup set for checking if a fact tuple already exists.
@@ -78,18 +78,99 @@ pub fn evaluate(
     // Resolve show atoms
     if !show_all {
         for stmt in &program.statements {
-            if let Statement::ShowSig(s) = stmt {
-                for i in 0..atom_table.len() {
-                    let atom = atom_table.resolve(crate::types::AtomId(i as u32));
-                    if atom.predicate == s.predicate && atom.args.len() == s.arity {
-                        show_atoms.push(crate::types::AtomId(i as u32));
+            match stmt {
+                Statement::ShowSig(s) => {
+                    for i in 0..atom_table.len() {
+                        let atom = atom_table.resolve(crate::types::AtomId(i as u32));
+                        if atom.predicate == s.predicate && atom.args.len() == s.arity {
+                            show_atoms.push(crate::types::AtomId(i as u32));
+                        }
+                    }
+                }
+                Statement::Show(s) => {
+                    // #show term : body. — enumerate body, evaluate term, match atoms
+                    let show_domain = &facts;
+                    instantiate::enumerate_body_public(
+                        &s.body, 0, &HashMap::new(), show_domain, show_domain, const_map,
+                        &mut |bindings| {
+                            match &s.term {
+                                ast::Term::Function(pred, term_args) => {
+                                    let args: Option<Vec<Value>> = term_args.iter()
+                                        .map(|t| instantiate::eval_term(t, bindings, const_map))
+                                        .collect();
+                                    if let Some(args) = args {
+                                        let ga = GroundAtom { predicate: *pred, args };
+                                        if let Some(id) = atom_table.get(&ga)
+                                            && !show_atoms.contains(&id) {
+                                                show_atoms.push(id);
+                                            }
+                                    }
+                                }
+                                ast::Term::Symbolic(pred) => {
+                                    let ga = GroundAtom { predicate: *pred, args: vec![] };
+                                    if let Some(id) = atom_table.get(&ga)
+                                        && !show_atoms.contains(&id) {
+                                            show_atoms.push(id);
+                                        }
+                                }
+                                _ => {}
+                            }
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Add classical negation consistency constraints: :- p(X), -p(X).
+    // For each __neg_P atom, find matching P atoms and add constraints.
+    add_classical_neg_constraints(&atom_table, interner, &mut all_rules);
+
+    GroundProgram { atom_table, rules: all_rules, show_atoms, show_all }
+}
+
+/// For each classically negated predicate `__neg_P`, add integrity constraints
+/// `:- P(args), __neg_P(args)` to prevent contradictions.
+fn add_classical_neg_constraints(
+    atom_table: &AtomTable,
+    interner: &Interner,
+    rules: &mut Vec<GroundRule>,
+) {
+    // Collect all atoms grouped by predicate
+    let mut by_predicate: HashMap<SymbolId, Vec<AtomId>> = HashMap::new();
+    for i in 0..atom_table.len() {
+        let id = crate::types::AtomId(i as u32);
+        let atom = atom_table.resolve(id);
+        by_predicate.entry(atom.predicate).or_default().push(id);
+    }
+
+    // Match __neg_X predicates with X predicates
+    // matches: __neg_ prefix (5 chars of the resolved name)
+    for (&pred, neg_ids) in &by_predicate {
+        let name = interner.resolve(pred);
+        if let Some(pos_name) = name.strip_prefix("__neg_") {
+            // Find the positive predicate
+            for (&pos_pred, pos_ids) in &by_predicate {
+                if interner.resolve(pos_pred) == pos_name {
+                    // For each pair with matching args, add constraint
+                    for &neg_id in neg_ids {
+                        let neg_atom = atom_table.resolve(neg_id);
+                        for &pos_id in pos_ids {
+                            let pos_atom = atom_table.resolve(pos_id);
+                            if neg_atom.args == pos_atom.args {
+                                rules.push(GroundRule {
+                                    head: RuleHead::Constraint,
+                                    body_pos: vec![pos_id, neg_id],
+                                    body_neg: vec![],
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
     }
-
-    GroundProgram { atom_table, rules: all_rules, show_atoms, show_all }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -100,7 +181,7 @@ fn evaluate_stratum(
     known: &mut FactSet,
     atom_table: &mut AtomTable,
     all_rules: &mut Vec<GroundRule>,
-    _interner: &mut Interner,
+    interner: &mut Interner,
     const_map: &HashMap<SymbolId, Value>,
 ) {
     const MAX_ITERATIONS: usize = 10_000;
@@ -154,26 +235,46 @@ fn evaluate_stratum(
         iterations += 1;
 
         for rule in &normal_rules {
+            let has_agg = rule.body.iter().any(|l| matches!(l,
+                ast::Literal::Pos(ast::BodyAtom::Aggregate(_)) |
+                ast::Literal::Neg(ast::BodyAtom::Aggregate(_))
+            ));
+            let mut agg_ctx_owned;
+            let agg_ctx = if has_agg {
+                agg_ctx_owned = AggContext { facts: &domain, interner, const_map };
+                Some(&mut agg_ctx_owned)
+            } else {
+                None
+            };
             let ground_rules = instantiate::instantiate_rule_with_domain(
-                &rule.head, &rule.body, facts, &domain, atom_table, const_map,
+                &rule.head, &rule.body, facts, &domain, atom_table, const_map, agg_ctx,
             );
             for gr in ground_rules {
                 let key = rule_key(&gr);
                 if !seen_rules.insert(key) { continue; }
+
+                // Only add head to facts if ALL body_pos atoms are in the domain
+                // (prevents premature fact addition for conditional literal rules)
+                let body_satisfiable = gr.body_pos.iter().all(|bp| {
+                    let a = atom_table.resolve(*bp);
+                    domain_known.get(&a.predicate).is_some_and(|s| s.contains(&a.args))
+                });
 
                 let head_ids = match &gr.head {
                     RuleHead::Normal(id) => vec![*id],
                     RuleHead::Disjunction(ids) => ids.clone(),
                     _ => vec![],
                 };
-                for head_id in head_ids {
-                    let head_atom = atom_table.resolve(head_id);
-                    let pred = head_atom.predicate;
-                    let args = head_atom.args.clone();
-                    if add_to_both(pred, args.clone(), facts, known) {
-                        changed = true;
+                if body_satisfiable {
+                    for head_id in &head_ids {
+                        let head_atom = atom_table.resolve(*head_id);
+                        let pred = head_atom.predicate;
+                        let args = head_atom.args.clone();
+                        if add_to_both(pred, args.clone(), facts, known) {
+                            changed = true;
+                        }
+                        add_to_both(pred, args, &mut domain, &mut domain_known);
                     }
-                    add_to_both(pred, args, &mut domain, &mut domain_known);
                 }
                 all_rules.push(gr);
             }
@@ -182,7 +283,18 @@ fn evaluate_stratum(
 
     // Ground constraints
     for c in &constraints {
-        let ground_rules = instantiate::instantiate_constraint(&c.body, facts, &domain, atom_table, const_map);
+        let has_agg = c.body.iter().any(|l| matches!(l,
+            ast::Literal::Pos(ast::BodyAtom::Aggregate(_)) |
+            ast::Literal::Neg(ast::BodyAtom::Aggregate(_))
+        ));
+        let mut agg_ctx_owned;
+        let agg_ctx = if has_agg {
+            agg_ctx_owned = AggContext { facts: &domain, interner, const_map };
+            Some(&mut agg_ctx_owned)
+        } else {
+            None
+        };
+        let ground_rules = instantiate::instantiate_constraint(&c.body, facts, &domain, atom_table, const_map, agg_ctx);
         all_rules.extend(ground_rules);
     }
 }

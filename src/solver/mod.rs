@@ -106,29 +106,35 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
                 if !loop_nogoods.is_empty() {
                     let mut added_any = false;
                     for nogood in loop_nogoods {
-                        match nogood.len() {
-                            0 => return SolveResult::Unsatisfiable,
-                            1 => {
-                                let lit = nogood[0];
-                                if assignment.value_lit(lit) == LBool::Undef {
-                                    assignment.assign(lit, assignment.decision_level(), None);
-                                    added_any = true;
-                                } else if assignment.value_lit(lit) == LBool::False {
-                                    if assignment.decision_level() == 0 {
-                                        return SolveResult::Unsatisfiable;
-                                    }
-                                    let unassigned = assignment.backtrack_to(0);
-                                    for atom in unassigned {
-                                        vsids.insert(atom);
-                                    }
-                                    assignment.assign(lit, 0, None);
-                                    added_any = true;
+                        if nogood.is_empty() { return SolveResult::Unsatisfiable; }
+                        if nogood.len() == 1 {
+                            let lit = nogood[0];
+                            if assignment.value_lit(lit) == LBool::Undef {
+                                assignment.assign(lit, assignment.decision_level(), None);
+                                added_any = true;
+                            } else if assignment.value_lit(lit) == LBool::False {
+                                if assignment.decision_level() == 0 {
+                                    return SolveResult::Unsatisfiable;
                                 }
-                            }
-                            _ => {
-                                clause_db.add_clause(nogood, true);
+                                let unassigned = assignment.backtrack_to(0);
+                                for atom in unassigned { vsids.insert(atom); }
+                                assignment.assign(lit, 0, None);
                                 added_any = true;
                             }
+                        } else {
+                            // Multi-literal UFS nogood (for level-0 atoms).
+                            // Always add to clause_db for watched literal propagation.
+                            // Sort so non-false literals come first for watches.
+                            let mut sorted = nogood;
+                            sorted.sort_by_key(|l| if assignment.value_lit(*l) == LBool::False { 1u8 } else { 0 });
+                            clause_db.add_clause(sorted, true);
+                            // If all literals are currently false, backtrack to make
+                            // the clause useful for future BCP.
+                            if assignment.decision_level() > 0 {
+                                let unassigned = assignment.backtrack_to(0);
+                                for atom in unassigned { vsids.insert(atom); }
+                            }
+                            added_any = true;
                         }
                     }
                     if added_any { continue; }
@@ -255,22 +261,28 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
                 if !loop_nogoods.is_empty() {
                     let mut added_any = false;
                     for nogood in loop_nogoods {
-                        match nogood.len() {
-                            0 => return models,
-                            1 => {
-                                let lit = nogood[0];
-                                if assignment.value_lit(lit) == LBool::Undef {
-                                    assignment.assign(lit, assignment.decision_level(), None);
-                                    added_any = true;
-                                } else if assignment.value_lit(lit) == LBool::False {
-                                    if assignment.decision_level() == 0 { return models; }
-                                    let u = assignment.backtrack_to(0);
-                                    for atom in u { vsids.insert(atom); }
-                                    assignment.assign(lit, 0, None);
-                                    added_any = true;
-                                }
+                        if nogood.is_empty() { return models; }
+                        if nogood.len() == 1 {
+                            let lit = nogood[0];
+                            if assignment.value_lit(lit) == LBool::Undef {
+                                assignment.assign(lit, assignment.decision_level(), None);
+                                added_any = true;
+                            } else if assignment.value_lit(lit) == LBool::False {
+                                if assignment.decision_level() == 0 { return models; }
+                                let u = assignment.backtrack_to(0);
+                                for atom in u { vsids.insert(atom); }
+                                assignment.assign(lit, 0, None);
+                                added_any = true;
                             }
-                            _ => { clause_db.add_clause(nogood, true); added_any = true; }
+                        } else {
+                            let mut sorted = nogood;
+                            sorted.sort_by_key(|l| if assignment.value_lit(*l) == LBool::False { 1u8 } else { 0 });
+                            clause_db.add_clause(sorted, true);
+                            if assignment.decision_level() > 0 {
+                                let u = assignment.backtrack_to(0);
+                                for atom in u { vsids.insert(atom); }
+                            }
+                            added_any = true;
                         }
                     }
                     if added_any { continue; }

@@ -53,6 +53,11 @@ impl UnfoundedSetChecker {
     /// 2. Remove atoms that have a defining rule whose positive body is entirely outside U
     ///    and whose body is satisfiable under the current assignment
     /// 3. Repeat until fixpoint. Remaining atoms in U are unfounded.
+    ///
+    /// For each unfounded atom, generates a loop nogood.
+    /// Unit nogoods (¬atom) are used for atoms not assigned at level 0.
+    /// For atoms at level 0, multi-literal nogoods include the false body atoms
+    /// that block support, to guide CDCL properly.
     pub fn check(&mut self, assignment: &Assignment) -> Vec<Vec<Lit>> {
         let n = self.num_atoms as usize;
         let mut in_u = vec![false; n];
@@ -83,8 +88,34 @@ impl UnfoundedSetChecker {
 
         let mut nogoods = Vec::new();
         for i in 0..self.num_atoms {
-            if in_u[i as usize] {
-                nogoods.push(vec![Lit::neg(AtomId(i))]);
+            if !in_u[i as usize] { continue; }
+            let atom = AtomId(i);
+            if assignment.level(atom) > 0 {
+                // Atom was decided/propagated above level 0 — simple unit nogood
+                nogoods.push(vec![Lit::neg(atom)]);
+            } else {
+                // Atom at level 0 (forced by clause) — build multi-literal nogood
+                // including the false body atoms that block support paths.
+                let mut nogood = vec![Lit::neg(atom)];
+                for &ri in &self.defining_rules[atom.index()] {
+                    for &bp in &self.rule_body_pos[ri] {
+                        if !in_u[bp.index()] && assignment.value(bp) == LBool::False
+                            && assignment.level(bp) > 0
+                        {
+                            let lit = Lit::pos(bp);
+                            if !nogood.contains(&lit) { nogood.push(lit); }
+                        }
+                    }
+                    for &bn in &self.rule_body_neg[ri] {
+                        if assignment.value(bn) == LBool::True && assignment.level(bn) > 0 {
+                            let lit = Lit::neg(bn);
+                            if !nogood.contains(&lit) { nogood.push(lit); }
+                        }
+                    }
+                }
+                // If we only have ¬atom (no decision-level literals to blame),
+                // this is truly unsupported at level 0 → unit nogood
+                nogoods.push(nogood);
             }
         }
         nogoods

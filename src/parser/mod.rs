@@ -59,15 +59,19 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match &self.current {
             Token::If => self.parse_constraint(),
+            Token::WeakIf => self.parse_weak_constraint(),
             Token::Show => self.parse_show(),
             Token::Const => self.parse_const(),
             Token::LBrace => self.parse_choice_statement(None),
             Token::Number(_) => {
                 // Could be `N { ... }` (choice with lower bound) or a fact like `p(1).`
-                // We need to try parsing a term and see what follows.
                 self.parse_head_starting_with_term_or_ident()
             }
             Token::Ident(_) => self.parse_head_starting_with_ident(),
+            Token::Minus => {
+                // Classical negation in head: `-a :- b.` or `-a.`
+                self.parse_head_starting_with_ident()
+            }
             Token::Minimize => self.parse_optimize(true),
             Token::Maximize => self.parse_optimize(false),
             _ => Err(self.error(format!("unexpected token {:?} at start of statement", self.current))),
@@ -81,6 +85,38 @@ impl<'a> Parser<'a> {
         let body = self.parse_body()?;
         self.expect(&Token::Dot)?;
         Ok(Statement::Constraint(Constraint { body }))
+    }
+
+    // ── weak constraint ──────────────────────────────────────
+    // :~ body. [W@P, T1, ...]  →  desugared to #minimize { W@P,T1,... : body }.
+
+    fn parse_weak_constraint(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::WeakIf)?; // :~
+        let body = if self.current == Token::Dot {
+            vec![]
+        } else {
+            self.parse_body()?
+        };
+        self.expect(&Token::Dot)?;
+        // Parse [W@P, T1, ...]
+        self.expect(&Token::LBrack)?;
+        let weight = self.parse_term()?;
+        let priority = if self.current == Token::At {
+            self.advance()?;
+            Some(self.parse_term()?)
+        } else {
+            None
+        };
+        let mut terms = Vec::new();
+        while self.current == Token::Comma {
+            self.advance()?;
+            terms.push(self.parse_term()?);
+        }
+        self.expect(&Token::RBrack)?;
+        Ok(Statement::Optimize(OptimizeDirective {
+            minimize: true,
+            elements: vec![OptimizeElement { weight, priority, terms, condition: body }],
+        }))
     }
 
     // ── head disambiguation ────────────────────────────────
@@ -207,18 +243,20 @@ impl<'a> Parser<'a> {
         Ok(Statement::Optimize(OptimizeDirective { minimize, elements }))
     }
 
-    /// Parse `W[,P][,T1,...] : condition` or `W @ P : condition`
+    /// Parse `W @ P[,T1,...] : condition` or `W[,T1,...] : condition`
     fn parse_optimize_element(&mut self) -> Result<OptimizeElement, ParseError> {
         let weight = self.parse_term()?;
-        // Optional priority after @ or as second term after comma
-        let priority = None;
+        // Optional priority after @
+        let priority = if self.current == Token::At {
+            self.advance()?;
+            Some(self.parse_term()?)
+        } else {
+            None
+        };
         let mut terms = Vec::new();
         if self.current == Token::Comma {
             self.advance()?;
-            let next = self.parse_term()?;
-            // Check if there's more terms (weight, priority, terms...)
-            // For simplicity: first term is weight, remaining terms are tuple identifiers
-            terms.push(next);
+            terms.push(self.parse_term()?);
             while self.current == Token::Comma {
                 self.advance()?;
                 terms.push(self.parse_term()?);
@@ -343,10 +381,25 @@ impl<'a> Parser<'a> {
         if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
             return Ok(BodyAtom::Aggregate(self.parse_aggregate()?));
         }
-        // Parse an atom or comparison. Comparisons have the form `term op term`.
-        // An atom is `ident(...)`. If we see an ident with no parens and it's followed by
-        // a comparison operator, it's a comparison (e.g. `X > 0`).
-        // Strategy: parse a term, then check if a comparison op follows.
+        // Classical negation in body: `-ident(...)` → rewrite to `__neg_ident(...)`
+        if self.current == Token::Minus && self.lexer.peek_is_ident() {
+            self.advance()?; // consume -
+            let Token::Ident(id) = self.advance()? else {
+                return Err(self.error("expected identifier after '-' for classical negation".into()));
+            };
+            let name = self.lexer.interner().resolve(id).to_string();
+            let neg_pred = self.lexer.interner().intern(&format!("__neg_{name}"));
+            let args = if self.current == Token::LParen {
+                self.advance()?;
+                let args = self.parse_term_list()?;
+                self.expect(&Token::RParen)?;
+                args
+            } else {
+                vec![]
+            };
+            return Ok(BodyAtom::Atom(Atom { predicate: neg_pred, args }));
+        }
+        // Parse an atom or comparison.
         if let Token::Ident(id) = self.current.clone() {
             self.advance()?;
             if self.current == Token::LParen {
@@ -355,30 +408,46 @@ impl<'a> Parser<'a> {
                 let args = self.parse_term_list()?;
                 self.expect(&Token::RParen)?;
                 let atom = Atom { predicate: id, args };
-                // Could still be followed by a comparison op if this is weird,
-                // but standard ASP doesn't allow that. Return as atom.
+                // Check for conditional literal: `p(X) : q(X), ...`
+                if self.current == Token::Colon {
+                    self.advance()?;
+                    let condition = self.parse_condition_list()?;
+                    return Ok(BodyAtom::CondLiteral(atom, condition));
+                }
                 return Ok(BodyAtom::Atom(atom));
             }
             // Bare ident — could be `pred` (0-arity atom) or start of comparison.
             let term = self.finish_term_from_ident(id)?;
             if let Some(op) = self.try_comp_op() {
+                // Check if RHS is an aggregate: `term op #agg{...}` → lower-bounded aggregate
+                if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+                    return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(op, term)?));
+                }
                 let right = self.parse_term()?;
                 return Ok(BodyAtom::Comparison(Comparison { left: term, op, right }));
             }
-            // 0-arity atom
+            // 0-arity atom (possibly conditional)
             if let Term::Symbolic(pred) = term {
-                return Ok(BodyAtom::Atom(Atom { predicate: pred, args: vec![] }));
+                let atom = Atom { predicate: pred, args: vec![] };
+                if self.current == Token::Colon {
+                    self.advance()?;
+                    let condition = self.parse_condition_list()?;
+                    return Ok(BodyAtom::CondLiteral(atom, condition));
+                }
+                return Ok(BodyAtom::Atom(atom));
             }
-            // It's some expression that isn't a comparison or atom — error
             return Err(self.error("expected atom or comparison in body".to_string()));
         }
-        // Not starting with ident — must be a comparison (e.g. `X > 0`, `1 = 1`).
+        // Not starting with ident — could be a comparison or lower-bounded aggregate.
         let left = self.parse_term()?;
         if let Some(op) = self.try_comp_op() {
+            // Check if RHS is an aggregate: `term op #agg{...}` → lower-bounded aggregate
+            if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+                return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(op, left)?));
+            }
             let right = self.parse_term()?;
             Ok(BodyAtom::Comparison(Comparison { left, op, right }))
         } else {
-            // Could be a variable used as a 0-arity atom? That's not valid ASP.
             Err(self.error(format!("expected comparison operator, got {:?}", self.current)))
         }
     }
@@ -398,6 +467,24 @@ impl<'a> Parser<'a> {
     }
 
     // ── aggregates ─────────────────────────────────────────
+
+    /// Parse an aggregate with a known lower bound: `L op #agg{...} [op U]`
+    /// The `op` is from the perspective of the left term (e.g., `2 <= #count{...}`
+    /// means the aggregate >= 2, so we flip the operator).
+    fn parse_aggregate_with_lower(&mut self, left_op: CompOp, left_term: Term) -> Result<Aggregate, ParseError> {
+        // Flip: `L op agg` → agg has lower bound with flipped op
+        let lower_op = match left_op {
+            CompOp::Lt => CompOp::Gt,   // L < agg → agg > L
+            CompOp::Leq => CompOp::Geq, // L <= agg → agg >= L
+            CompOp::Gt => CompOp::Lt,   // L > agg → agg < L
+            CompOp::Geq => CompOp::Leq, // L >= agg → agg <= L
+            CompOp::Eq => CompOp::Eq,
+            CompOp::Neq => CompOp::Neq,
+        };
+        let mut agg = self.parse_aggregate()?;
+        agg.lower = Some((lower_op, left_term));
+        Ok(agg)
+    }
 
     fn parse_aggregate(&mut self) -> Result<Aggregate, ParseError> {
         let function = match &self.current {
@@ -455,8 +542,20 @@ impl<'a> Parser<'a> {
     // ── atom ───────────────────────────────────────────────
 
     fn parse_atom(&mut self) -> Result<Atom, ParseError> {
+        // Handle classical negation: `-ident(...)` → rewrite predicate to `__neg_ident`
+        let classically_negated = self.current == Token::Minus;
+        if classically_negated {
+            self.advance()?;
+        }
         let predicate = match self.advance()? {
-            Token::Ident(id) => id,
+            Token::Ident(id) => {
+                if classically_negated {
+                    let name = self.lexer.interner().resolve(id).to_string();
+                    self.lexer.interner().intern(&format!("__neg_{name}"))
+                } else {
+                    id
+                }
+            }
             other => return Err(self.error(format!("expected predicate name, got {other:?}"))),
         };
         let args = if self.current == Token::LParen {

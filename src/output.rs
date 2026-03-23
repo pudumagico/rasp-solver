@@ -11,9 +11,10 @@ pub fn print_result(result: &SolveResult, program: &GroundProgram, interner: &In
                 .iter()
                 .filter(|id| program.show_all || program.show_atoms.contains(id))
                 .filter(|id| {
-                    // Skip internal auxiliary atoms (names starting with __)
+                    // Skip internal auxiliary atoms (__ prefix) but keep __neg_ (classical negation)
                     let atom = program.atom_table.resolve(**id);
-                    !interner.resolve(atom.predicate).starts_with("__")
+                    let name = interner.resolve(atom.predicate);
+                    !name.starts_with("__") || name.starts_with("__neg_")
                 })
                 .map(|id| format_atom(program.atom_table.resolve(*id), interner))
                 .collect();
@@ -27,9 +28,13 @@ pub fn print_result(result: &SolveResult, program: &GroundProgram, interner: &In
 }
 
 fn format_atom(atom: &GroundAtom, interner: &Interner) -> String {
-    let name = interner.resolve(atom.predicate);
+    let raw_name = interner.resolve(atom.predicate);
+    // Render __neg_p as -p for classical negation
+    let name = raw_name.strip_prefix("__neg_")
+        .map(|n| format!("-{n}"))
+        .unwrap_or_else(|| raw_name.to_string());
     if atom.args.is_empty() {
-        name.to_string()
+        name
     } else {
         let args: Vec<String> = atom.args.iter().map(|v| format_value(v, interner)).collect();
         format!("{name}({})", args.join(","))

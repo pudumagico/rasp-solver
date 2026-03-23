@@ -17,6 +17,7 @@ pub enum Token {
 
     // Operators
     If,     // :-
+    WeakIf, // :~
     DotDot, // ..
     Not,    // not
 
@@ -51,6 +52,8 @@ pub enum Token {
     Max,
     Minimize,
     Maximize,
+    At,    // @
+    Tilde, // ~
 
     // Special
     Eof,

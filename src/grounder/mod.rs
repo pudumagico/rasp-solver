@@ -196,40 +196,56 @@ fn collect_constants(program: &Program, _interner: &mut Interner) -> HashMap<Sym
     map
 }
 
-/// Ground optimization directives. Returns (weighted_atoms, is_minimize) pairs.
+/// A single optimization specification at a given priority level.
+pub struct OptSpec {
+    pub priority: i64,
+    pub weighted: Vec<(i64, AtomId)>,
+    pub minimize: bool,
+}
+
+/// Ground optimization directives. Returns per-priority-level specs sorted by
+/// descending priority (highest priority = optimized first).
 pub fn ground_optimize(
     program: &Program,
     ground: &GroundProgram,
     _interner: &Interner,
-) -> Vec<(Vec<(i64, AtomId)>, bool)> {
+) -> Vec<OptSpec> {
     let const_map = HashMap::new();
-    let mut results = Vec::new();
+    // Collect all weighted atoms grouped by (priority, minimize)
+    let mut by_priority: HashMap<(i64, bool), Vec<(i64, AtomId)>> = HashMap::new();
     for stmt in &program.statements {
         if let Statement::Optimize(opt) = stmt {
-            let mut weighted = Vec::new();
             for elem in &opt.elements {
                 let Some(Value::Int(w)) = eval_term(&elem.weight, &HashMap::new(), &const_map) else { continue; };
-                // Find atoms matching the condition
+                let priority = elem.priority.as_ref()
+                    .and_then(|t| eval_term(t, &HashMap::new(), &const_map))
+                    .and_then(|v| if let Value::Int(p) = v { Some(p) } else { None })
+                    .unwrap_or(0);
                 for lit in &elem.condition {
                     let ba = match lit {
                         crate::parser::ast::Literal::Pos(ba) => ba,
                         _ => continue,
                     };
                     if let crate::parser::ast::BodyAtom::Atom(a) = ba {
-                        // Find all ground atoms matching this predicate
                         for i in 0..ground.atom_table.len() {
                             let atom = ground.atom_table.resolve(AtomId(i as u32));
                             if atom.predicate == a.predicate {
-                                weighted.push((w, AtomId(i as u32)));
+                                by_priority.entry((priority, opt.minimize))
+                                    .or_default()
+                                    .push((w, AtomId(i as u32)));
                             }
                         }
                     }
                 }
             }
-            results.push((weighted, opt.minimize));
         }
     }
-    results
+    let mut specs: Vec<OptSpec> = by_priority.into_iter()
+        .map(|((priority, minimize), weighted)| OptSpec { priority, weighted, minimize })
+        .collect();
+    // Sort descending by priority (highest first for lexicographic optimization)
+    specs.sort_by(|a, b| b.priority.cmp(&a.priority));
+    specs
 }
 
 #[cfg(test)]

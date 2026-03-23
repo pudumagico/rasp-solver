@@ -35,6 +35,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'-') {
                     self.advance_byte();
                     Ok(Token::If)
+                } else if self.peek() == Some(b'~') {
+                    self.advance_byte();
+                    Ok(Token::WeakIf)
                 } else {
                     Ok(Token::Colon)
                 }
@@ -87,6 +90,8 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'=') { self.advance_byte(); Ok(Token::Geq) }
                 else { Ok(Token::Gt) }
             }
+            b'@' => { self.advance_byte(); Ok(Token::At) }
+            b'~' => { self.advance_byte(); Ok(Token::Tilde) }
             _ => Err(self.error_at(start_line, start_col, &format!("unexpected character '{}'", b as char))),
         }
     }
@@ -97,6 +102,19 @@ impl<'a> Lexer<'a> {
 
     pub fn col(&self) -> usize {
         self.col
+    }
+
+    pub fn interner(&mut self) -> &mut Interner {
+        self.interner
+    }
+
+    /// Check if the next token would be an identifier (lowercase letter at current pos).
+    /// Used to disambiguate `-ident` (classical negation) from `-number` (arithmetic).
+    pub fn peek_is_ident(&self) -> bool {
+        // Skip whitespace to find the actual next character
+        let mut i = self.pos;
+        while i < self.bytes.len() && self.bytes[i].is_ascii_whitespace() { i += 1; }
+        i < self.bytes.len() && self.bytes[i].is_ascii_lowercase()
     }
 
     fn peek(&self) -> Option<u8> {
@@ -422,8 +440,20 @@ mod tests {
 
     #[test]
     fn unexpected_char() {
-        let err = lex_err("@");
+        let err = lex_err("$");
         assert!(err.message.contains("unexpected character"));
+    }
+
+    #[test]
+    fn at_and_tilde_tokens() {
+        let tokens = lex_all("@ ~");
+        assert_eq!(tokens, vec![Token::At, Token::Tilde]);
+    }
+
+    #[test]
+    fn weak_if_token() {
+        let tokens = lex_all(":~ :-");
+        assert_eq!(tokens, vec![Token::WeakIf, Token::If]);
     }
 
     #[test]

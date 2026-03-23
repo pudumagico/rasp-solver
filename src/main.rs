@@ -81,29 +81,29 @@ fn main() {
     }
 }
 
+/// Compute lexicographic cost vector for a model. Each entry corresponds to a
+/// priority level (sorted descending by priority). Lower is better.
 fn compute_cost(
     model: &[asp_solver::types::AtomId],
-    opt_specs: &[(Vec<(i64, asp_solver::types::AtomId)>, bool)],
-) -> i64 {
-    let mut total = 0i64;
-    for (weights, minimize) in opt_specs {
-        let cost: i64 = weights.iter()
+    opt_specs: &[asp_solver::grounder::OptSpec],
+) -> Vec<i64> {
+    opt_specs.iter().map(|spec| {
+        let cost: i64 = spec.weighted.iter()
             .filter(|(_, atom)| model.contains(atom))
             .map(|(w, _)| *w)
             .sum();
-        total += if *minimize { cost } else { -cost };
-    }
-    total
+        if spec.minimize { cost } else { -cost }
+    }).collect()
 }
 
 fn solve_optimize(
     ground: &asp_solver::ground::program::GroundProgram,
     interner: &asp_solver::interner::Interner,
-    opt_specs: &[(Vec<(i64, asp_solver::types::AtomId)>, bool)],
+    opt_specs: &[asp_solver::grounder::OptSpec],
 ) {
     use asp_solver::solver::SolveResult;
 
-    // Iterative optimization: enumerate models, track best cost
+    // Enumerate all models, track and print each improving solution
     let models = asp_solver::solver::solve_many(ground, 0);
     if models.is_empty() {
         println!("UNSATISFIABLE");
@@ -123,5 +123,9 @@ fn solve_optimize(
 
     let result = SolveResult::Satisfiable(best_model.clone());
     asp_solver::output::print_result(&result, ground, interner);
-    println!("Optimization: {best_cost}");
+    let costs: Vec<String> = opt_specs.iter().zip(&best_cost)
+        .map(|(spec, c)| format!("{c}@{}", spec.priority))
+        .collect();
+    println!("Optimization: {}", costs.join(" "));
+    println!("OPTIMUM FOUND");
 }

@@ -1,11 +1,21 @@
 use std::collections::HashMap;
 
 use crate::ground::program::{AtomTable, GroundAtom, GroundRule, RuleHead};
+use crate::interner::Interner;
 use crate::parser::ast::{self, BinOp, BodyAtom, CompOp, Literal, Term};
 use crate::types::{AtomId, SymbolId, Value};
 
+use super::aggregate;
+
 pub type Bindings = HashMap<SymbolId, Value>;
 pub type FactStore = HashMap<SymbolId, Vec<Vec<Value>>>;
+
+/// Context needed for grounding aggregates inside rule/constraint bodies.
+pub struct AggContext<'a> {
+    pub facts: &'a FactStore,
+    pub interner: &'a mut Interner,
+    pub const_map: &'a HashMap<SymbolId, Value>,
+}
 
 /// Instantiate a rule (possibly disjunctive) using `domain` for positive matching.
 pub fn instantiate_rule_with_domain(
@@ -15,9 +25,12 @@ pub fn instantiate_rule_with_domain(
     domain: &FactStore,
     atom_table: &mut AtomTable,
     const_map: &HashMap<SymbolId, Value>,
+    agg_ctx: Option<&mut AggContext<'_>>,
 ) -> Vec<GroundRule> {
     let mut results = Vec::new();
     let bindings = Bindings::new();
+    let has_cond = body.iter().any(|l| matches!(l,
+        Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
     enumerate_body(body, 0, &bindings, domain, facts, const_map, &mut |b| {
         let ground_heads: Vec<AtomId> = heads.iter()
             .filter_map(|h| ground_atom(h, b, const_map))
@@ -32,6 +45,12 @@ pub fn instantiate_rule_with_domain(
         };
         results.push(GroundRule { head, body_pos, body_neg });
     });
+    if has_cond {
+        ground_body_cond_literals(body, &bindings, domain, atom_table, const_map, &mut results);
+    }
+    if let Some(ctx) = agg_ctx {
+        ground_body_aggregates(body, &bindings, domain, atom_table, ctx, &mut results);
+    }
     results
 }
 
@@ -43,13 +62,22 @@ pub fn instantiate_constraint(
     domain: &FactStore,
     atom_table: &mut AtomTable,
     const_map: &HashMap<SymbolId, Value>,
+    agg_ctx: Option<&mut AggContext<'_>>,
 ) -> Vec<GroundRule> {
     let mut results = Vec::new();
     let bindings = Bindings::new();
+    let has_cond = body.iter().any(|l| matches!(l,
+        Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
     enumerate_body(body, 0, &bindings, domain, facts, const_map, &mut |b| {
         let (body_pos, body_neg) = ground_body(body, b, atom_table, const_map);
         results.push(GroundRule { head: RuleHead::Constraint, body_pos, body_neg });
     });
+    if has_cond {
+        ground_body_cond_literals(body, &Bindings::new(), domain, atom_table, const_map, &mut results);
+    }
+    if let Some(ctx) = agg_ctx {
+        ground_body_aggregates(body, &Bindings::new(), domain, atom_table, ctx, &mut results);
+    }
     results
 }
 
@@ -84,6 +112,19 @@ pub fn instantiate_choice(
         }
     });
     results
+}
+
+/// Public wrapper for enumerate_body.
+pub fn enumerate_body_public(
+    body: &[Literal],
+    idx: usize,
+    bindings: &Bindings,
+    pos_domain: &FactStore,
+    naf_facts: &FactStore,
+    const_map: &HashMap<SymbolId, Value>,
+    callback: &mut impl FnMut(&Bindings),
+) {
+    enumerate_body(body, idx, bindings, pos_domain, naf_facts, const_map, callback);
 }
 
 /// Recursively enumerate all valid variable bindings for the body.
@@ -145,6 +186,10 @@ fn enumerate_body(
             }
         }
         Literal::Pos(BodyAtom::Aggregate(_)) | Literal::Neg(BodyAtom::Aggregate(_)) => {
+            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
+        }
+        Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..)) => {
+            // Conditional literals are expanded in ground_body, not during enumeration
             enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
         }
     }
@@ -261,13 +306,109 @@ fn ground_body(
             Literal::Pos(ba) => (ba, false),
             Literal::Neg(ba) => (ba, true),
         };
-        if let BodyAtom::Atom(a) = ba
-            && let Some(ga) = ground_atom(a, bindings, const_map) {
-                let id = atom_table.get_or_insert(ga);
-                if is_neg { neg.push(id); } else { pos.push(id); }
+        match ba {
+            BodyAtom::Atom(a) => {
+                if let Some(ga) = ground_atom(a, bindings, const_map) {
+                    let id = atom_table.get_or_insert(ga);
+                    if is_neg { neg.push(id); } else { pos.push(id); }
+                }
             }
+            BodyAtom::Aggregate(_) => {
+                // Handled by ground_body_aggregates
+            }
+            BodyAtom::Comparison(_) => {}
+            BodyAtom::CondLiteral(_, _) => {
+                // Handled by ground_body_cond_literals
+            }
+        }
     }
     (pos, neg)
+}
+
+/// Expand conditional body literals (`p(X) : q(X)`) into conjunctions.
+/// For each ground binding from the condition domain, creates the grounded
+/// atom (even if it doesn't exist yet) and adds it to parent rules' bodies.
+fn ground_body_cond_literals(
+    body: &[Literal],
+    bindings: &Bindings,
+    domain: &FactStore,
+    atom_table: &mut AtomTable,
+    const_map: &HashMap<SymbolId, Value>,
+    rules: &mut Vec<GroundRule>,
+) {
+    let parent_count = rules.len();
+    for lit in body {
+        let (ba, is_neg) = match lit {
+            Literal::Pos(ba) => (ba, false),
+            Literal::Neg(ba) => (ba, true),
+        };
+        if let BodyAtom::CondLiteral(atom, condition) = ba {
+            // Enumerate condition domain to get bindings, then ground the atom.
+            // Use get_or_insert to create atoms that don't exist yet (they'll
+            // have no support and be forced false by Clark's completion).
+            let mut cond_atoms = Vec::new();
+            enumerate_body(condition, 0, bindings, domain, domain, const_map, &mut |cond_bindings| {
+                if let Some(ga) = ground_atom(atom, cond_bindings, const_map) {
+                    let id = atom_table.get_or_insert(ga);
+                    if !cond_atoms.contains(&id) {
+                        cond_atoms.push(id);
+                    }
+                }
+            });
+            for rule in rules[..parent_count].iter_mut() {
+                for &id in &cond_atoms {
+                    if is_neg { rule.body_neg.push(id); } else { rule.body_pos.push(id); }
+                }
+            }
+        }
+    }
+}
+
+/// Ground all aggregates that appear in body literals. For each aggregate,
+/// call `ground_aggregate` to produce auxiliary rules + result atom, then
+/// patch the result atom into the body of the parent rules (not aux rules).
+///
+/// If a positive aggregate returns None (unsatisfiable), all parent rules
+/// are removed (body can never be satisfied). If a negated aggregate returns
+/// None, its negation is trivially true and the literal is omitted.
+fn ground_body_aggregates(
+    body: &[Literal],
+    bindings: &Bindings,
+    domain: &FactStore,
+    atom_table: &mut AtomTable,
+    ctx: &mut AggContext<'_>,
+    rules: &mut Vec<GroundRule>,
+) {
+    let parent_count = rules.len();
+    for lit in body {
+        let (ba, is_neg) = match lit {
+            Literal::Pos(ba) => (ba, false),
+            Literal::Neg(ba) => (ba, true),
+        };
+        if let BodyAtom::Aggregate(agg) = ba {
+            match aggregate::ground_aggregate(
+                agg, bindings, domain, atom_table, ctx.interner, ctx.const_map,
+            ) {
+                Some((aux_rules, result_id)) => {
+                    for rule in rules[..parent_count].iter_mut() {
+                        if is_neg {
+                            rule.body_neg.push(result_id);
+                        } else {
+                            rule.body_pos.push(result_id);
+                        }
+                    }
+                    rules.extend(aux_rules);
+                }
+                None => {
+                    if !is_neg {
+                        // Positive aggregate that can never be true → remove all parent rules
+                        rules.drain(..parent_count);
+                    }
+                    // Negated aggregate that can never be true → always true → no-op
+                }
+            }
+        }
+    }
 }
 
 
@@ -287,7 +428,7 @@ mod tests {
         facts.insert(a_id, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
 
         let ast::Statement::Rule(rule) = &prog.statements[2] else { panic!() };
-        let rules = instantiate_rule_with_domain(&rule.head, &rule.body, &facts, &facts, &mut atom_table, &HashMap::new());
+        let rules = instantiate_rule_with_domain(&rule.head, &rule.body, &facts, &facts, &mut atom_table, &HashMap::new(), None);
         assert_eq!(rules.len(), 2);
     }
 

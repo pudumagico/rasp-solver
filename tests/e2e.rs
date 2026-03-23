@@ -15,10 +15,17 @@ fn solve_program(input: &str) -> Result<Option<Vec<String>>, String> {
                 .filter(|id| ground.show_all || ground.show_atoms.contains(id))
                 .map(|id| {
                     let atom = ground.atom_table.resolve(*id);
-                    let name = interner.resolve(atom.predicate);
-                    if name.starts_with("__") { return String::new(); } // skip auxiliary
+                    let raw_name = interner.resolve(atom.predicate);
+                    // Skip auxiliary atoms but keep __neg_ (classical negation)
+                    if raw_name.starts_with("__") && !raw_name.starts_with("__neg_") {
+                        return String::new();
+                    }
+                    // Render __neg_p as -p
+                    let name = raw_name.strip_prefix("__neg_")
+                        .map(|n| format!("-{n}"))
+                        .unwrap_or_else(|| raw_name.to_string());
                     if atom.args.is_empty() {
-                        name.to_string()
+                        name
                     } else {
                         let args: Vec<String> = atom.args.iter().map(|v| match v {
                             asp_solver::types::Value::Int(n) => n.to_string(),
@@ -800,4 +807,386 @@ fn pool_in_choice() {
     let result = solve_program("{sel(1..3)}. :- not sel(1), not sel(2), not sel(3).");
     let model = result.unwrap().expect("SAT");
     assert!(!model.is_empty());
+}
+
+// ── optimization helper ──────────────────────────────────
+
+/// Run optimization pipeline: parse → ground → enumerate all models → return
+/// (best_model_names_sorted, cost_vector).
+fn solve_optimize(input: &str) -> Result<Option<(Vec<String>, Vec<i64>)>, String> {
+    let mut interner = Interner::new();
+    let ast = parser::parse(input, &mut interner).map_err(|e| format!("parse error: {e}"))?;
+    let ground = grounder::ground(&ast, &mut interner).map_err(|e| format!("ground error: {e}"))?;
+    let opt_specs = grounder::ground_optimize(&ast, &ground, &interner);
+
+    let models = solver::solve_many(&ground, 0);
+    if models.is_empty() { return Ok(None); }
+
+    let compute_cost = |model: &[asp_solver::types::AtomId]| -> Vec<i64> {
+        opt_specs.iter().map(|spec| {
+            let cost: i64 = spec.weighted.iter()
+                .filter(|(_, atom)| model.contains(atom))
+                .map(|(w, _)| *w)
+                .sum();
+            if spec.minimize { cost } else { -cost }
+        }).collect()
+    };
+
+    let mut best_idx = 0;
+    let mut best_cost = compute_cost(&models[0]);
+    for (i, model) in models.iter().enumerate().skip(1) {
+        let cost = compute_cost(model);
+        if cost < best_cost {
+            best_cost = cost;
+            best_idx = i;
+        }
+    }
+
+    let best = &models[best_idx];
+    let mut names: Vec<String> = best.iter()
+        .filter(|id| ground.show_all || ground.show_atoms.contains(id))
+        .map(|id| {
+            let atom = ground.atom_table.resolve(*id);
+            let raw_name = interner.resolve(atom.predicate);
+            if raw_name.starts_with("__") && !raw_name.starts_with("__neg_") { return String::new(); }
+            let name = raw_name.strip_prefix("__neg_")
+                .map(|n| format!("-{n}"))
+                .unwrap_or_else(|| raw_name.to_string());
+            if atom.args.is_empty() {
+                name
+            } else {
+                let args: Vec<String> = atom.args.iter().map(|v| match v {
+                    asp_solver::types::Value::Int(n) => n.to_string(),
+                    asp_solver::types::Value::Sym(s) => interner.resolve(*s).to_string(),
+                }).collect();
+                format!("{name}({})", args.join(","))
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort();
+    Ok(Some((names, best_cost)))
+}
+
+// ── #min aggregate ──────────────────────────────────────
+
+#[test]
+fn min_aggregate_leq() {
+    // val(1), val(3), val(5) — min <= 2 should be SAT (min is 1)
+    assert_sat(
+        "val(1). val(3). val(5). ok :- #min { X : val(X) } <= 2. :- not ok.",
+        &["ok", "val(1)", "val(3)", "val(5)"],
+    );
+}
+
+#[test]
+fn min_aggregate_geq() {
+    // {sel(1); sel(3); sel(5)} with constraint: min of selected >= 3
+    // So sel(1) can't be chosen. Valid models: {sel(3)}, {sel(5)}, {sel(3),sel(5)}.
+    let result = solve_program(
+        "1 {sel(1); sel(3); sel(5)}. :- not #min { X : sel(X) } >= 3."
+    ).unwrap().expect("SAT");
+    assert!(!result.contains(&"sel(1)".to_string()));
+}
+
+#[test]
+fn min_aggregate_impossible() {
+    // All values are 5, but we need min <= 2 — no elements qualify, UNSAT
+    assert_unsat(
+        "val(5). val(6). ok :- #min { X : val(X) } <= 2. :- not ok."
+    );
+}
+
+// ── #max aggregate ──────────────────────────────────────
+
+#[test]
+fn max_aggregate_geq() {
+    // val(1), val(3), val(5) — max >= 4 should be SAT (max is 5)
+    assert_sat(
+        "val(1). val(3). val(5). ok :- #max { X : val(X) } >= 4. :- not ok.",
+        &["ok", "val(1)", "val(3)", "val(5)"],
+    );
+}
+
+#[test]
+fn max_aggregate_leq() {
+    // {sel(1); sel(3); sel(5)} with constraint: max of selected <= 3
+    // So sel(5) can't be chosen.
+    let result = solve_program(
+        "1 {sel(1); sel(3); sel(5)}. :- not #max { X : sel(X) } <= 3."
+    ).unwrap().expect("SAT");
+    assert!(!result.contains(&"sel(5)".to_string()));
+}
+
+#[test]
+fn max_aggregate_impossible() {
+    // All values are 1, but we need max >= 5 — UNSAT
+    assert_unsat(
+        "val(1). val(2). ok :- #max { X : val(X) } >= 5. :- not ok."
+    );
+}
+
+// ── @ priority levels ───────────────────────────────────
+
+#[test]
+fn optimize_at_priority_parses() {
+    let result = solve_program("{a}. {b}. #minimize { 1@2 : a; 2@1 : b }.");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn optimize_priority_lexicographic() {
+    // a costs 1 at priority 2 (higher = more important), b costs 100 at priority 1
+    // Lexicographic: first minimize priority 2 (don't pick a), then priority 1 (don't pick b)
+    // Optimal: neither a nor b
+    let (model, costs) = solve_optimize(
+        "{a}. {b}. #minimize { 1@2 : a; 100@1 : b }."
+    ).unwrap().unwrap();
+    assert!(!model.contains(&"a".to_string()));
+    assert!(!model.contains(&"b".to_string()));
+    assert_eq!(costs, vec![0, 0]); // [priority 2 cost, priority 1 cost]
+}
+
+#[test]
+fn optimize_single_priority() {
+    // Simple case: minimize picking a (cost 5) vs b (cost 1). Should pick b only.
+    let (model, _) = solve_optimize(
+        "1 {a; b}. #minimize { 5 : a; 1 : b }."
+    ).unwrap().unwrap();
+    assert!(!model.contains(&"a".to_string()));
+    assert!(model.contains(&"b".to_string()));
+}
+
+// ── weak constraints ────────────────────────────────────
+
+#[test]
+fn weak_constraint_parses() {
+    let result = solve_program("{a}. :~ a. [1@0]");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn weak_constraint_minimize() {
+    // :~ a. [5@0] means: penalty 5 if a is true → should prefer a = false
+    let (model, costs) = solve_optimize(
+        "{a}. {b}. :~ a. [5@0] :~ b. [1@0]"
+    ).unwrap().unwrap();
+    assert!(!model.contains(&"a".to_string()));
+    assert!(!model.contains(&"b".to_string()));
+    assert_eq!(costs, vec![0]);
+}
+
+#[test]
+fn weak_constraint_with_priority() {
+    // Two weak constraints at different priorities
+    let (model, costs) = solve_optimize(
+        "1 {a; b} 1. :~ a. [1@2] :~ b. [100@1]"
+    ).unwrap().unwrap();
+    // Priority 2 is more important: avoid a → pick b
+    assert!(!model.contains(&"a".to_string()));
+    assert!(model.contains(&"b".to_string()));
+    assert_eq!(costs[0], 0); // priority 2 cost = 0 (a not chosen)
+}
+
+// ── aggregate lower bounds ──────────────────────────────
+
+#[test]
+fn count_lower_bound() {
+    // 2 <= #count{X : sel(X)} — at least 2 must be selected
+    let result = solve_program(
+        "1 {sel(1); sel(2); sel(3)} 3. :- not 2 <= #count { X : sel(X) }."
+    ).unwrap().expect("SAT");
+    let count = result.iter().filter(|s| s.starts_with("sel")).count();
+    assert!(count >= 2);
+}
+
+#[test]
+fn count_double_bounded() {
+    // 1 <= #count{...} <= 2 — between 1 and 2 selected
+    let result = solve_program(
+        "{sel(1); sel(2); sel(3)}. :- not 1 <= #count { X : sel(X) } <= 2."
+    ).unwrap().expect("SAT");
+    let count = result.iter().filter(|s| s.starts_with("sel")).count();
+    assert!(count >= 1 && count <= 2);
+}
+
+#[test]
+fn count_lower_bound_unsat() {
+    // Need at least 3, but only 2 atoms exist
+    assert_unsat(
+        "1 {sel(1); sel(2)} 2. :- not 3 <= #count { X : sel(X) }."
+    );
+}
+
+// ── conditional body literals ───────────────────────────
+
+#[test]
+fn conditional_body_literal() {
+    // ok :- p(X) : q(X).  means "ok if p(X) holds for all X where q(X)"
+    assert_sat(
+        "q(1). q(2). p(1). p(2). ok :- p(X) : q(X). :- not ok.",
+        &["ok", "p(1)", "p(2)", "q(1)", "q(2)"],
+    );
+}
+
+#[test]
+fn conditional_body_literal_unsat() {
+    // q(1), q(2), but p(1) only — p(2) missing → conditional not satisfied
+    assert_unsat(
+        "q(1). q(2). p(1). ok :- p(X) : q(X). :- not ok."
+    );
+}
+
+#[test]
+fn conditional_body_with_constraint() {
+    // Constraint: :- p(X) : q(X). means "not all p(X) for q(X) can hold"
+    // With q(1), q(2) → :- p(1), p(2). → can't have both p(1) and p(2)
+    let result = solve_program(
+        "q(1). q(2). {p(1); p(2)}. :- p(X) : q(X)."
+    ).unwrap().expect("SAT");
+    // At most one of p(1), p(2) can be true
+    let p_count = result.iter().filter(|s| s.starts_with("p(")).count();
+    assert!(p_count <= 1, "Expected at most 1 p atom, got {p_count}: {result:?}");
+}
+
+// ── classical negation ──────────────────────────────────
+
+#[test]
+fn classical_negation_fact() {
+    // -a. means __neg_a is a fact, displayed as -a
+    assert_sat("-a.", &["-a"]);
+}
+
+#[test]
+fn classical_negation_rule() {
+    // -b :- a. with a as fact
+    assert_sat("a. -b :- a.", &["-b", "a"]);
+}
+
+#[test]
+fn classical_negation_consistency() {
+    // a. -a. should be UNSAT (contradiction: a and -a both true)
+    assert_unsat("a. -a.");
+}
+
+#[test]
+fn classical_negation_in_body() {
+    // c :- -a. with -a as fact
+    assert_sat("-a. c :- -a.", &["-a", "c"]);
+}
+
+#[test]
+fn classical_negation_naf() {
+    // b :- not -a. — b holds if -a is not provable
+    assert_sat("b :- not -a.", &["b"]);
+}
+
+#[test]
+fn classical_negation_with_args() {
+    // -p(1). p(2). — -p(1) and p(2) coexist; -p(2) + p(2) would conflict
+    assert_sat("-p(1). p(2).", &["-p(1)", "p(2)"]);
+}
+
+#[test]
+fn classical_negation_conflict_args() {
+    // p(1). -p(1). — contradiction on same arguments
+    assert_unsat("p(1). -p(1).");
+}
+
+// ── #show with computed terms ───────────────────────────
+
+#[test]
+fn show_sig_works() {
+    // #show p/1 should only show p atoms
+    let result = solve_program("p(1). q(2). #show p/1.").unwrap().expect("SAT");
+    assert_eq!(result, vec!["p(1)"]);
+}
+
+#[test]
+fn show_computed_term() {
+    // #show p(X) : q(X). should show p atoms where q holds
+    let result = solve_program("p(1). p(2). q(1). #show p(X) : q(X).").unwrap().expect("SAT");
+    assert_eq!(result, vec!["p(1)"]);
+}
+
+#[test]
+fn debug_count_choice() {
+    let mut interner = asp_solver::interner::Interner::new();
+    let input = "1 {sel(1); sel(2); sel(3)} 3. :- not #count { X : sel(X) } >= 2.";
+    let ast = asp_solver::parser::parse(input, &mut interner).unwrap();
+    let ground = asp_solver::grounder::ground(&ast, &mut interner).unwrap();
+    let constraints: Vec<_> = ground.rules.iter()
+        .filter(|r| matches!(r.head, asp_solver::ground::program::RuleHead::Constraint))
+        .collect();
+    for c in &constraints {
+        let pos: Vec<u32> = c.body_pos.iter().map(|i| i.0).collect();
+        let neg: Vec<u32> = c.body_neg.iter().map(|i| i.0).collect();
+        eprintln!("Constraint: pos={pos:?} neg={neg:?}");
+    }
+    let agg_atoms: Vec<_> = (0..ground.atom_table.len())
+        .filter(|&i| {
+            let atom = ground.atom_table.resolve(asp_solver::types::AtomId(i as u32));
+            interner.resolve(atom.predicate).starts_with("__agg")
+        })
+        .collect();
+    eprintln!("Aggregate auxiliary atoms: {}", agg_atoms.len());
+    let agg_constraints: Vec<_> = constraints.iter()
+        .filter(|c| !c.body_neg.is_empty())
+        .collect();
+    eprintln!("Constraints with body_neg: {}", agg_constraints.len());
+    assert!(!agg_constraints.is_empty(), "No constraint found with aggregate result in body_neg");
+}
+
+#[test]
+fn count_geq_with_choice() {
+    // Postfix: #count{} >= 2 — at least 2 must be selected
+    let result = solve_program(
+        "1 {sel(1); sel(2); sel(3)} 3. :- not #count { X : sel(X) } >= 2."
+    ).unwrap().expect("SAT");
+    let count = result.iter().filter(|s| s.starts_with("sel")).count();
+    assert!(count >= 2, "Expected at least 2 sel atoms, got {count}: {result:?}");
+}
+
+#[test]
+fn debug_count_solve() {
+    use asp_solver::solver::{self, SolveResult};
+    let mut interner = asp_solver::interner::Interner::new();
+    let input = "1 {sel(1); sel(2); sel(3)} 3. :- not #count { X : sel(X) } >= 2.";
+    let ast = asp_solver::parser::parse(input, &mut interner).unwrap();
+    let ground = asp_solver::grounder::ground(&ast, &mut interner).unwrap();
+    
+    // Print all atoms with IDs
+    for i in 0..ground.atom_table.len() {
+        let id = asp_solver::types::AtomId(i as u32);
+        let atom = ground.atom_table.resolve(id);
+        let name = interner.resolve(atom.predicate);
+        let args: Vec<String> = atom.args.iter().map(|v| match v {
+            asp_solver::types::Value::Int(n) => n.to_string(),
+            asp_solver::types::Value::Sym(s) => interner.resolve(*s).to_string(),
+        }).collect();
+        eprintln!("  Atom {i}: {name}({})", args.join(","));
+    }
+    
+    // Print choice atoms
+    let translation = asp_solver::solver::translate::translate(&ground);
+    eprintln!("\nChoice atoms: {:?}", translation.choice_atoms.iter().enumerate()
+        .filter(|&(_, b)| *b).map(|(i, _)| i).collect::<Vec<_>>());
+    
+    // Print all clauses
+    eprintln!("\nClauses:");
+    for (ci, clause) in translation.clauses.iter().enumerate() {
+        let lits: Vec<String> = clause.iter().map(|l| {
+            let sign = if l.positive { "+" } else { "-" };
+            format!("{sign}{}", l.atom.0)
+        }).collect();
+        eprintln!("  C{ci}: {}", lits.join(" ∨ "));
+    }
+    
+    let result = solver::solve(&ground);
+    match &result {
+        SolveResult::Satisfiable(model) => {
+            eprintln!("\nModel atoms: {:?}", model.iter().map(|a| a.0).collect::<Vec<_>>());
+        }
+        SolveResult::Unsatisfiable => eprintln!("\nUNSAT"),
+    }
 }
