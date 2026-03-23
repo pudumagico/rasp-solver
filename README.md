@@ -14,100 +14,132 @@ cargo build --release
 
 # Solve from stdin
 echo "a. b :- a. :- not b." | ./target/release/asp-solver
+
+# Enumerate all models
+echo "{a; b; c}." | ./target/release/asp-solver -n 0
 ```
 
 ## Supported Language Features
 
-rasp-solver supports a practical subset of the [ASP-Core-2](https://www.mat.unical.it/aspcomp2013/ASPStandardization) language:
+rasp-solver supports the [ASP-Core-2](https://www.mat.unical.it/aspcomp2013/ASPStandardization) language:
 
 ```prolog
-% Facts
-node(1). node(2). edge(1,2).
-
-% Rules with variables
+% Facts and rules
+node(1..5). edge(1,2). edge(2,3).
 path(X,Y) :- edge(X,Y).
 path(X,Z) :- path(X,Y), edge(Y,Z).
 
-% Integrity constraints
-:- path(X,X).
-
-% Negation as failure
-safe(X) :- node(X), not dangerous(X).
-
-% Choice rules with cardinality bounds
+% Choice rules with bounds
 { assign(N,C) : color(C) } = 1 :- node(N).
 
-% Arithmetic and comparisons
-next(X+1) :- num(X), X < 10.
+% Integrity constraints
+:- assign(N1,C), assign(N2,C), edge(N1,N2).
 
-% Aggregates (#count)
-:- #count { X : selected(X) } > 3.
+% Classical negation
+-safe(X) :- hazard(X).
+:- safe(X), -safe(X).
+
+% Aggregates
+:- 2 <= #count { X : sel(X) } <= 5.
+:- #sum { W,I : item(I,W) } > capacity.
+ok :- #min { X : val(X) } >= 3.
+ok :- #max { X : val(X) } <= 10.
+
+% Conditional body literals
+covered :- reached(X) : target(X).
+
+% Optimization with priorities
+#minimize { W@2,E : edge(E), weight(E,W) }.
+#minimize { 1@1,N : penalty(N) }.
+
+% Weak constraints
+:~ late(X). [1@0, X]
 
 % Directives
-#show path/2.
-#const max = 10.
+#show assign/2.
+#show path(X,Y) : important(X).
+#const n = 10.
 ```
 
 | Feature | Status |
 |---------|--------|
-| Facts and rules | Supported |
-| Integrity constraints | Supported |
-| Choice rules `L { ... } U` | Supported |
-| `= N` cardinality syntax | Supported |
-| Conditional elements `{ a(X) : p(X) }` | Supported |
-| Negation as failure (`not`) | Supported |
-| Arithmetic (`+`, `-`, `*`, `/`, `\`) | Supported |
-| Comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) | Supported |
-| `#count` aggregates | Supported |
-| `#show` directives | Supported |
-| `#const` definitions | Supported |
-| Non-stratifiable programs | Supported |
-| Disjunctive heads (`a \| b`) | Not yet |
-| Optimization (`#minimize`) | Not yet |
-| `#sum`, `#min`, `#max` aggregates | Not yet |
+| Facts and rules | ✓ |
+| Integrity constraints | ✓ |
+| Choice rules `L { ... } U` | ✓ |
+| Conditional elements `{ a(X) : p(X) }` | ✓ |
+| Conditional body literals `a :- p(X) : q(X).` | ✓ |
+| Negation as failure (`not`) | ✓ |
+| Classical negation (`-a`) | ✓ |
+| Disjunctive heads (`a \| b :- c.`) | ✓ |
+| Arithmetic (`+`, `-`, `*`, `/`, `\`) | ✓ |
+| Comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) | ✓ |
+| Pools / ranges (`p(1..n)`) | ✓ |
+| `#count` aggregates | ✓ |
+| `#sum` aggregates | ✓ |
+| `#min` / `#max` aggregates | ✓ |
+| Aggregate lower/double bounds | ✓ |
+| `#minimize` / `#maximize` | ✓ |
+| `@` priority levels (lexicographic) | ✓ |
+| Weak constraints (`:~`) | ✓ |
+| `#show` directives (sig + computed) | ✓ |
+| `#const` definitions | ✓ |
+| Multi-model enumeration (`-n N`) | ✓ |
 
 ## Architecture
 
 ```
-ASP Source → [Lexer] → [Parser] → AST
-                                    ↓
-                              [Grounder]
-                           SCC + Stratification
-                         Semi-naive Evaluation
-                         Domain-aware Matching
-                                    ↓
-                            Ground Program
-                                    ↓
-                              [Translator]
-                          Clark's Completion
-                                    ↓
-                            [CDCL Solver]
-                        Two-watched Literals
-                        First-UIP Learning
-                        VSIDS + Phase Saving
-                        Luby Restarts
-                        Clause GC
-                                    ↓
-                        [Unfounded Set Checker]
-                       Greatest Fixpoint Algorithm
-                                    ↓
-                           Answer Set / UNSAT
+                    ┌──────────────────────┐
+  ASP Source ──────>│  Lexer + Parser      │
+                    │  (recursive descent) │
+                    └─────────┬────────────┘
+                              │ AST
+                    ┌─────────▼────────────┐
+                    │  Grounder            │
+                    │  ├ Tarjan SCC        │
+                    │  ├ Stratification    │
+                    │  └ Semi-naive eval   │
+                    └─────────┬────────────┘
+                              │ Ground rules
+                    ┌─────────▼────────────┐
+                    │  Clark's Completion   │
+                    │  (SAT translation)   │
+                    └─────────┬────────────┘
+                              │ Clauses
+                    ┌─────────▼────────────┐
+                    │  CDCL Solver         │
+                    │  ├ 2-watched lits    │
+                    │  ├ First-UIP learn   │
+                    │  ├ VSIDS + phase     │
+                    │  └ Luby restarts     │
+                    │         │            │
+                    │  Unfounded Set Check │
+                    │  (loop nogoods)      │
+                    └─────────┬────────────┘
+                              │
+                     Answer Set / UNSAT
 ```
 
 ## Benchmark Results
 
 Solved on Apple M-series, release build:
 
-| Instance | Problem | Atoms | Result | Time |
-|----------|---------|-------|--------|------|
-| queens_8 | 8-Queens | 64 | SAT | 11ms |
-| queens_12 | 12-Queens | 144 | SAT | 18ms |
-| queens_16 | 16-Queens | 256 | SAT | 37ms |
-| graph_color_3 | 3-coloring (6 nodes) | 18 | SAT | 9ms |
-| hamiltonian | Ham. cycle (4 nodes) | 6 | SAT | 8ms |
-| pigeonhole_7_6 | 7 pigeons / 6 holes | 42 | UNSAT | 88ms |
-| reachability_20 | Reachability (20 nodes) | 400 | SAT | 10ms |
-| stable_marriage | Stable marriage (3×3) | 9 | SAT | 8ms |
+| Instance | Problem | Result | Time |
+|----------|---------|--------|------|
+| queens_8 | 8-Queens | SAT | 34ms |
+| queens_12 | 12-Queens | SAT | 40ms |
+| queens_16 | 16-Queens | SAT | 60ms |
+| queens_20 | 20-Queens | SAT | 101ms |
+| queens_30 | 30-Queens | SAT | 362ms |
+| queens_50 | 50-Queens | SAT | 3.7s |
+| pigeonhole_7_6 | 7→6 holes | UNSAT | 125ms |
+| graph_color_3 | 3-coloring (6 nodes) | SAT | 35ms |
+| graph_color_100 | 3-coloring (100 nodes) | SAT | 1.1s |
+| hamiltonian | Ham. cycle (4 nodes) | SAT | 34ms |
+| knight_tour_5 | Knight tour 5×5 | SAT | 155ms |
+| latin_square_4 | Latin square 4×4 | SAT | 39ms |
+| schur_4_9 | Schur(4,9) | SAT | 65ms |
+| stable_marriage | Stable marriage 3×3 | SAT | 32ms |
+| reachability_20 | Reachability (20 nodes) | SAT | 37ms |
 
 Run benchmarks yourself:
 ```bash
@@ -120,7 +152,7 @@ scripts/benchmark.sh
 # Build
 cargo build --release
 
-# Run tests (152 tests: 73 unit + 79 integration)
+# Run tests (202 tests: 75 unit + 127 integration)
 cargo test
 
 # Lint
@@ -128,9 +160,6 @@ cargo clippy
 
 # Compare against clingo (if installed)
 scripts/oracle_test.sh
-
-# Fast CI check
-scripts/ci_fast.sh
 ```
 
 ## Comparison to Other Systems
@@ -148,23 +177,27 @@ rasp-solver is not yet competitive with clingo on large instances — clingo has
 
 ```
 src/
-├── parser/       # Lexer + recursive descent parser
-│   ├── lexer.rs  # Byte-level tokenizer
-│   ├── ast.rs    # AST type definitions
-│   └── mod.rs    # Parser implementation
-├── grounder/     # Semi-naive bottom-up grounding
-│   ├── scc.rs    # Tarjan SCC + stratification
-│   ├── seminaive.rs  # Fixpoint evaluation
-│   └── instantiate.rs # Rule instantiation + joins
-├── solver/       # CDCL-based solver
-│   ├── clause.rs     # Watched literals + clause DB
-│   ├── analyze.rs    # First-UIP conflict analysis
-│   ├── decide.rs     # VSIDS heuristic
-│   ├── unfounded.rs  # Stable model semantics
-│   └── mod.rs        # Main CDCL loop
-├── types.rs      # AtomId, SymbolId, Lit, Value
-├── interner.rs   # String interning
-└── output.rs     # Answer set formatting
+├── parser/           # Lexer + recursive descent parser
+│   ├── lexer.rs      # Byte-level tokenizer
+│   ├── token.rs      # Token definitions
+│   ├── ast.rs         # AST type definitions
+│   └── mod.rs         # Parser implementation
+├── grounder/         # Semi-naive bottom-up grounding
+│   ├── scc.rs         # Tarjan SCC + stratification
+│   ├── seminaive.rs   # Fixpoint evaluation
+│   ├── instantiate.rs # Rule instantiation + joins
+│   ├── aggregate.rs   # #count/#sum/#min/#max encoding
+│   └── mod.rs         # Pool expansion, optimization
+├── solver/           # CDCL-based solver
+│   ├── clause.rs      # Watched literals + clause DB
+│   ├── analyze.rs     # First-UIP conflict analysis
+│   ├── decide.rs      # VSIDS heuristic
+│   ├── unfounded.rs   # Stable model semantics
+│   └── mod.rs         # Main CDCL loop
+├── ground/program.rs # Ground program representation
+├── types.rs           # AtomId, SymbolId, Lit, Value
+├── interner.rs        # String interning
+└── output.rs          # Answer set formatting
 ```
 
 ## License

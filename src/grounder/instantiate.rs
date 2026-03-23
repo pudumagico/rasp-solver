@@ -334,7 +334,7 @@ fn ground_body_cond_literals(
     domain: &FactStore,
     atom_table: &mut AtomTable,
     const_map: &HashMap<SymbolId, Value>,
-    rules: &mut Vec<GroundRule>,
+    rules: &mut [GroundRule],
 ) {
     let parent_count = rules.len();
     for lit in body {
