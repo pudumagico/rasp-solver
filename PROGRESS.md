@@ -25,6 +25,8 @@
   - Classical negation desugared to `__neg_` predicates + consistency constraints
   - `#show` with computed terms and conditions
   - Multi-argument indexing for grounder joins (per-arg hash index, most selective filter)
+  - Vec-backed variable bindings (O(1) lookup/insert/remove, no hashing)
+  - Comparison-driven variable binding (solve equalities to bind free variables before joins)
   - Symmetry breaking: lex-leader constraints for uniform 2-arg choice predicates
 - [x] CDCL Solver: two-watched-literal BCP, first-UIP, VSIDS + phase saving, Luby restarts
   - Domain-aware initial polarity (choice atoms → false, derived atoms → true)

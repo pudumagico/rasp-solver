@@ -175,8 +175,9 @@ fn expand_term_list_ranges(terms: &[Term], const_map: &HashMap<SymbolId, Value>)
 /// Expand a single term: Range(a,b) → [Integer(a), ..., Integer(b)], others → [self]
 fn expand_single_term(term: &Term, const_map: &HashMap<SymbolId, Value>) -> Vec<Term> {
     if let Term::Range(lo, hi) = term {
-        let lo_val = eval_term(lo, &HashMap::new(), const_map);
-        let hi_val = eval_term(hi, &HashMap::new(), const_map);
+        let empty = instantiate::Bindings::new();
+        let lo_val = eval_term(lo, &empty, const_map);
+        let hi_val = eval_term(hi, &empty, const_map);
         if let (Some(Value::Int(a)), Some(Value::Int(b))) = (lo_val, hi_val) {
             return (a..=b).map(Term::Integer).collect();
         }
@@ -189,7 +190,7 @@ fn collect_constants(program: &Program, _interner: &mut Interner) -> HashMap<Sym
     let mut map = HashMap::new();
     for stmt in &program.statements {
         if let Statement::Const(c) = stmt
-            && let Some(val) = eval_term(&c.value, &HashMap::new(), &map) {
+            && let Some(val) = eval_term(&c.value, &instantiate::Bindings::new(), &map) {
                 map.insert(c.name, val);
             }
     }
@@ -216,9 +217,10 @@ pub fn ground_optimize(
     for stmt in &program.statements {
         if let Statement::Optimize(opt) = stmt {
             for elem in &opt.elements {
-                let Some(Value::Int(w)) = eval_term(&elem.weight, &HashMap::new(), &const_map) else { continue; };
+                let empty = instantiate::Bindings::new();
+                let Some(Value::Int(w)) = eval_term(&elem.weight, &empty, &const_map) else { continue; };
                 let priority = elem.priority.as_ref()
-                    .and_then(|t| eval_term(t, &HashMap::new(), &const_map))
+                    .and_then(|t| eval_term(t, &empty, &const_map))
                     .and_then(|v| if let Value::Int(p) = v { Some(p) } else { None })
                     .unwrap_or(0);
                 for lit in &elem.condition {

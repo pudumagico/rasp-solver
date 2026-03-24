@@ -57,7 +57,7 @@ pub fn evaluate(
             && r.body.is_empty() && r.head.len() == 1 {
                 let h = &r.head[0];
                 let args: Option<Vec<Value>> = h.args.iter()
-                    .map(|t| instantiate::eval_term(t, &HashMap::new(), const_map))
+                    .map(|t| instantiate::eval_term(t, &instantiate::Bindings::new(), const_map))
                     .collect();
                 if let Some(args) = args
                     && add_to_both(h.predicate, args.clone(), &mut facts, &mut known) {
@@ -91,7 +91,7 @@ pub fn evaluate(
                     // #show term : body. — enumerate body, evaluate term, match atoms
                     let show_domain = &facts;
                     instantiate::enumerate_body_public(
-                        &s.body, 0, &HashMap::new(), show_domain, show_domain, const_map,
+                        &s.body, 0, &instantiate::Bindings::new(), show_domain, show_domain, const_map,
                         &mut |bindings| {
                             match &s.term {
                                 ast::Term::Function(pred, term_args) => {
@@ -454,7 +454,7 @@ fn generate_bound_constraints(
     let n = heads.len();
 
     let eval_bound = |term: &Term| -> Option<usize> {
-        let val = instantiate::eval_term(term, &HashMap::new(), const_map)?;
+        let val = instantiate::eval_term(term, &instantiate::Bindings::new(), const_map)?;
         match val {
             Value::Int(v) if v >= 0 => Some(v as usize),
             _ => None,

@@ -7,7 +7,33 @@ use crate::types::{AtomId, SymbolId, Value};
 
 use super::aggregate;
 
-pub type Bindings = HashMap<SymbolId, Value>;
+/// Vec-backed bindings: O(1) lookup/insert/remove indexed by SymbolId.0.
+#[derive(Debug)]
+pub struct Bindings {
+    slots: Vec<Option<Value>>,
+}
+
+impl Default for Bindings {
+    fn default() -> Self { Self { slots: vec![None; 256] } }
+}
+
+impl Bindings {
+    pub fn new() -> Self { Self::default() }
+    pub fn get(&self, k: &SymbolId) -> Option<&Value> { self.slots.get(k.0 as usize)?.as_ref() }
+    pub fn insert(&mut self, k: SymbolId, v: Value) {
+        let i = k.0 as usize;
+        if i >= self.slots.len() { self.slots.resize(i + 1, None); }
+        self.slots[i] = Some(v);
+    }
+    pub fn remove(&mut self, k: &SymbolId) {
+        if let Some(slot) = self.slots.get_mut(k.0 as usize) { *slot = None; }
+    }
+}
+
+impl Clone for Bindings {
+    fn clone(&self) -> Self { Self { slots: self.slots.clone() } }
+}
+
 pub type FactStore = HashMap<SymbolId, Vec<Vec<Value>>>;
 
 /// Per-argument index: predicate -> [arg_position -> {value -> [tuple indices]}]
@@ -343,6 +369,16 @@ fn enumerate_body(
         }
         Literal::Pos(BodyAtom::Comparison(cmp)) | Literal::Neg(BodyAtom::Comparison(cmp)) => {
             let negated = matches!(&body[idx], Literal::Neg(_));
+            // Try to solve for an unbound variable in positive equalities
+            if !negated && cmp.op == CompOp::Eq
+                && let Some((var, val)) = try_solve_equality(cmp, bindings, const_map) {
+                    let saved = trail.len();
+                    trail.push(var);
+                    bindings.insert(var, val);
+                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
+                    undo_trail(bindings, trail, saved);
+                    return;
+                }
             if let (Some(lv), Some(rv)) = (eval_term(&cmp.left, bindings, const_map), eval_term(&cmp.right, bindings, const_map)) {
                 let holds = eval_comp(cmp.op, &lv, &rv);
                 let pass = if negated { !holds } else { holds };
@@ -389,6 +425,63 @@ fn unify_args_trail(
         }
     }
     true
+}
+
+/// Try to solve `cmp` (an equality) for a single unbound variable.
+/// Handles: V = expr, expr = V, V +/- expr = val, expr +/- V = val, and reverses.
+fn try_solve_equality(
+    cmp: &ast::Comparison,
+    bindings: &Bindings,
+    const_map: &HashMap<SymbolId, Value>,
+) -> Option<(SymbolId, Value)> {
+    // Direct: Variable = evaluated_expr  or  evaluated_expr = Variable
+    if let Term::Variable(v) = &cmp.left
+        && bindings.get(v).is_none() {
+            return Some((*v, eval_term(&cmp.right, bindings, const_map)?));
+        }
+    if let Term::Variable(v) = &cmp.right
+        && bindings.get(v).is_none() {
+            return Some((*v, eval_term(&cmp.left, bindings, const_map)?));
+        }
+    // BinOp on one side with an unbound variable, other side evaluable
+    try_solve_binop_side(&cmp.left, &cmp.right, bindings, const_map)
+        .or_else(|| try_solve_binop_side(&cmp.right, &cmp.left, bindings, const_map))
+}
+
+/// Solve `binop_side = other_side` where binop_side is `V op expr` or `expr op V`.
+fn try_solve_binop_side(
+    binop_side: &Term,
+    other_side: &Term,
+    bindings: &Bindings,
+    const_map: &HashMap<SymbolId, Value>,
+) -> Option<(SymbolId, Value)> {
+    let Term::BinOp(op, l, r) = binop_side else { return None; };
+    let Value::Int(rhs) = eval_term(other_side, bindings, const_map)? else { return None; };
+    // Case: V op expr = rhs  (left is unbound variable)
+    if let Term::Variable(v) = l.as_ref()
+        && bindings.get(v).is_none() {
+            let Value::Int(e) = eval_term(r, bindings, const_map)? else { return None; };
+            // V + e = rhs => V = rhs - e;  V - e = rhs => V = rhs + e
+            let solved = match op {
+                BinOp::Add => rhs.checked_sub(e)?,
+                BinOp::Sub => rhs.checked_add(e)?,
+                _ => return None,
+            };
+            return Some((*v, Value::Int(solved)));
+        }
+    // Case: expr op V = rhs  (right is unbound variable)
+    if let Term::Variable(v) = r.as_ref()
+        && bindings.get(v).is_none() {
+            let Value::Int(e) = eval_term(l, bindings, const_map)? else { return None; };
+            // e + V = rhs => V = rhs - e;  e - V = rhs => V = e - rhs
+            let solved = match op {
+                BinOp::Add => rhs.checked_sub(e)?,
+                BinOp::Sub => e.checked_sub(rhs)?,
+                _ => return None,
+            };
+            return Some((*v, Value::Int(solved)));
+        }
+    None
 }
 
 fn undo_trail(bindings: &mut Bindings, trail: &mut Vec<SymbolId>, saved: usize) {
