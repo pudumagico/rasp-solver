@@ -28,6 +28,60 @@ pub fn build_arg_index(store: &FactStore) -> ArgIndex {
     idx
 }
 
+/// Derived-key expression: computes a hash-join key from tuple arguments.
+#[derive(Debug, Clone, Copy)]
+pub enum DerivedKeyExpr {
+    /// args[a] - args[b]
+    ArgDiff(usize, usize),
+    /// args[a] + args[b]
+    ArgSum(usize, usize),
+}
+
+impl DerivedKeyExpr {
+    fn eval_tuple(&self, tuple: &[Value]) -> Option<i64> {
+        match *self {
+            Self::ArgDiff(a, b) => match (&tuple[a], &tuple[b]) {
+                (Value::Int(x), Value::Int(y)) => Some(x - y),
+                _ => None,
+            },
+            Self::ArgSum(a, b) => match (&tuple[a], &tuple[b]) {
+                (Value::Int(x), Value::Int(y)) => Some(x + y),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A derived-key join for a specific body literal index.
+pub struct DerivedJoin {
+    /// Which body literal index this join applies to
+    pub body_idx: usize,
+    /// The key expression to evaluate on already-bound variables (first atom's vars)
+    pub bound_key_expr: Term,
+    /// Hash index: derived key value -> tuple indices for the second atom's predicate
+    pub index: HashMap<i64, Vec<usize>>,
+}
+
+/// Map from body literal index -> DerivedJoin
+pub type DerivedJoinMap = HashMap<usize, DerivedJoin>;
+
+/// Build a derived-key index for a predicate from a FactStore.
+pub fn build_derived_index(
+    store: &FactStore,
+    pred: SymbolId,
+    key_expr: DerivedKeyExpr,
+) -> HashMap<i64, Vec<usize>> {
+    let mut index = HashMap::new();
+    if let Some(tuples) = store.get(&pred) {
+        for (ti, tuple) in tuples.iter().enumerate() {
+            if let Some(key) = key_expr.eval_tuple(tuple) {
+                index.entry(key).or_insert_with(Vec::new).push(ti);
+            }
+        }
+    }
+    index
+}
+
 /// Context needed for grounding aggregates inside rule/constraint bodies.
 pub struct AggContext<'a> {
     pub facts: &'a FactStore,
@@ -65,7 +119,8 @@ pub fn instantiate_rule_with_index(
     let mut trail = Vec::new();
     let has_cond = body.iter().any(|l| matches!(l,
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
-    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, arg_idx, &mut |b| {
+    let no_dj = DerivedJoinMap::new();
+    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, arg_idx, &no_dj, &mut |b| {
         let ground_heads: Vec<AtomId> = heads.iter()
             .filter_map(|h| ground_atom(h, b, const_map))
             .map(|ga| atom_table.get_or_insert(ga))
@@ -111,12 +166,27 @@ pub fn instantiate_constraint_with_index(
     agg_ctx: Option<&mut AggContext<'_>>,
     arg_idx: &ArgIndex,
 ) -> Vec<GroundRule> {
+    let dj = detect_derived_joins(body, domain);
+    instantiate_constraint_impl(body, facts, domain, atom_table, const_map, agg_ctx, arg_idx, &dj)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instantiate_constraint_impl(
+    body: &[Literal],
+    facts: &FactStore,
+    domain: &FactStore,
+    atom_table: &mut AtomTable,
+    const_map: &HashMap<SymbolId, Value>,
+    agg_ctx: Option<&mut AggContext<'_>>,
+    arg_idx: &ArgIndex,
+    derived_joins: &DerivedJoinMap,
+) -> Vec<GroundRule> {
     let mut results = Vec::new();
     let mut bindings = Bindings::new();
     let mut trail = Vec::new();
     let has_cond = body.iter().any(|l| matches!(l,
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
-    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, arg_idx, &mut |b| {
+    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, arg_idx, derived_joins, &mut |b| {
         let (body_pos, body_neg) = ground_body(body, b, atom_table, const_map);
         results.push(GroundRule { head: RuleHead::Constraint, body_pos, body_neg });
     });
@@ -141,7 +211,8 @@ pub fn instantiate_choice(
     let mut bindings = Bindings::new();
     let mut trail = Vec::new();
     let arg_idx = build_arg_index(facts);
-    enumerate_body(&choice.body, 0, &mut bindings, facts, facts, const_map, &mut trail, &arg_idx, &mut |b| {
+    let no_dj = DerivedJoinMap::new();
+    enumerate_body(&choice.body, 0, &mut bindings, facts, facts, const_map, &mut trail, &arg_idx, &no_dj, &mut |b| {
         let mut head_atoms = Vec::new();
         for elem in &choice.elements {
             if elem.condition.is_empty() {
@@ -176,7 +247,8 @@ pub fn enumerate_body_public(
     let mut b = bindings.clone();
     let mut trail = Vec::new();
     let arg_idx = build_arg_index(pos_domain);
-    enumerate_body(body, idx, &mut b, pos_domain, naf_facts, const_map, &mut trail, &arg_idx, callback);
+    let no_dj = DerivedJoinMap::new();
+    enumerate_body(body, idx, &mut b, pos_domain, naf_facts, const_map, &mut trail, &arg_idx, &no_dj, callback);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -189,6 +261,7 @@ fn enumerate_body(
     const_map: &HashMap<SymbolId, Value>,
     trail: &mut Vec<SymbolId>,
     arg_idx: &ArgIndex,
+    derived_joins: &DerivedJoinMap,
     callback: &mut impl FnMut(&Bindings),
 ) {
     if idx >= body.len() {
@@ -198,6 +271,23 @@ fn enumerate_body(
     match &body[idx] {
         Literal::Pos(BodyAtom::Atom(atom)) => {
             let Some(tuples) = pos_domain.get(&atom.predicate) else { return; };
+
+            // Check for derived-key join: use hash index instead of full scan
+            if let Some(dj) = derived_joins.get(&idx)
+                && let Some(Value::Int(key)) = eval_term(&dj.bound_key_expr, bindings, const_map) {
+                    if let Some(indices) = dj.index.get(&key) {
+                        for &ti in indices {
+                            let tuple = &tuples[ti];
+                            let saved = trail.len();
+                            if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
+                                enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
+                            }
+                            undo_trail(bindings, trail, saved);
+                        }
+                    }
+                    return;
+                }
+
             // Find the most selective argument index
             let best = arg_idx.get(&atom.predicate).and_then(|per_arg| {
                 let mut best: Option<&[usize]> = None;
@@ -220,7 +310,7 @@ fn enumerate_body(
                     let tuple = &tuples[ti];
                     let saved = trail.len();
                     if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
-                        enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+                        enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
                 }
@@ -229,7 +319,7 @@ fn enumerate_body(
                     if tuple.len() != atom.args.len() { continue; }
                     let saved = trail.len();
                     if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
-                        enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+                        enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
                 }
@@ -248,7 +338,7 @@ fn enumerate_body(
                 false
             };
             if !matches {
-                enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+                enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
             }
         }
         Literal::Pos(BodyAtom::Comparison(cmp)) | Literal::Neg(BodyAtom::Comparison(cmp)) => {
@@ -257,15 +347,15 @@ fn enumerate_body(
                 let holds = eval_comp(cmp.op, &lv, &rv);
                 let pass = if negated { !holds } else { holds };
                 if pass {
-                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                 }
             }
         }
         Literal::Pos(BodyAtom::Aggregate(_)) | Literal::Neg(BodyAtom::Aggregate(_)) => {
-            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
         }
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..)) => {
-            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, callback);
+            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
         }
     }
 }
@@ -372,7 +462,8 @@ fn expand_choice_condition(
 ) {
     let mut b = base_bindings.clone();
     let mut trail = Vec::new();
-    enumerate_body(condition, 0, &mut b, facts, facts, const_map, &mut trail, arg_idx, &mut |b| {
+    let no_dj = DerivedJoinMap::new();
+    enumerate_body(condition, 0, &mut b, facts, facts, const_map, &mut trail, arg_idx, &no_dj, &mut |b| {
         if let Some(ga) = ground_atom(atom, b, const_map) {
             let id = atom_table.get_or_insert(ga);
             if !head_atoms.contains(&id) {
@@ -439,7 +530,8 @@ fn ground_body_cond_literals(
             let mut cond_bindings_mut = bindings.clone();
             let mut cond_trail = Vec::new();
             let cond_arg_idx = build_arg_index(domain);
-            enumerate_body(condition, 0, &mut cond_bindings_mut, domain, domain, const_map, &mut cond_trail, &cond_arg_idx, &mut |cond_bindings| {
+            let no_dj = DerivedJoinMap::new();
+            enumerate_body(condition, 0, &mut cond_bindings_mut, domain, domain, const_map, &mut cond_trail, &cond_arg_idx, &no_dj, &mut |cond_bindings| {
                 if let Some(ga) = ground_atom(atom, cond_bindings, const_map) {
                     let id = atom_table.get_or_insert(ga);
                     if !cond_atoms.contains(&id) {
@@ -503,6 +595,118 @@ fn ground_body_aggregates(
     }
 }
 
+/// Collect all variables from an AST term.
+fn collect_term_vars(t: &Term, vars: &mut Vec<SymbolId>) {
+    match t {
+        Term::Variable(v) => vars.push(*v),
+        Term::BinOp(_, l, r) => { collect_term_vars(l, vars); collect_term_vars(r, vars); }
+        Term::UnaryMinus(inner) => collect_term_vars(inner, vars),
+        Term::Function(_, args) => { for a in args { collect_term_vars(a, vars); } }
+        _ => {}
+    }
+}
+
+/// Detect self-join patterns connected by arithmetic equality and build derived-key indices.
+///
+/// Looks for patterns like: `pred(V1,V2), pred(V3,V4), expr_over_V1V2 = expr_over_V3V4`
+/// where the two positive atoms share the same predicate and the equality connects
+/// variables from the first atom to the second. Builds a hash index on the derived key.
+fn detect_derived_joins(body: &[Literal], domain: &FactStore) -> DerivedJoinMap {
+    use std::collections::HashSet;
+
+    let mut result = DerivedJoinMap::new();
+
+    // Find all positive atom positions with their predicates and variable sets
+    let mut pos_atoms: Vec<(usize, SymbolId, HashSet<SymbolId>)> = Vec::new();
+    for (i, lit) in body.iter().enumerate() {
+        if let Literal::Pos(BodyAtom::Atom(atom)) = lit {
+            let mut vars = HashSet::new();
+            for arg in &atom.args {
+                if let Term::Variable(v) = arg { vars.insert(*v); }
+            }
+            pos_atoms.push((i, atom.predicate, vars));
+        }
+    }
+
+    // Look for self-join pairs (same predicate, different body indices)
+    for a in 0..pos_atoms.len() {
+        for b in (a + 1)..pos_atoms.len() {
+            let (_, pred_a, ref vars_a) = pos_atoms[a];
+            let (idx_b, pred_b, ref vars_b) = pos_atoms[b];
+            if pred_a != pred_b { continue; }
+            // Variables must be disjoint (different variable names for the two atoms)
+            if !vars_a.is_disjoint(vars_b) { continue; }
+
+            // Find an equality comparison connecting vars from atom_a to atom_b
+            for lit in body {
+                let cmp = match lit {
+                    Literal::Pos(BodyAtom::Comparison(c)) if c.op == CompOp::Eq => c,
+                    _ => continue,
+                };
+
+                let mut left_vars = Vec::new();
+                let mut right_vars = Vec::new();
+                collect_term_vars(&cmp.left, &mut left_vars);
+                collect_term_vars(&cmp.right, &mut right_vars);
+
+                // Check: left uses only vars_a, right uses only vars_b (or vice versa)
+                let left_from_a = left_vars.iter().all(|v| vars_a.contains(v)) && !left_vars.is_empty();
+                let right_from_b = right_vars.iter().all(|v| vars_b.contains(v)) && !right_vars.is_empty();
+                let left_from_b = left_vars.iter().all(|v| vars_b.contains(v)) && !left_vars.is_empty();
+                let right_from_a = right_vars.iter().all(|v| vars_a.contains(v)) && !right_vars.is_empty();
+
+                // Determine which side is bound (atom_a, processed first) and which is the key expr
+                let (bound_expr, key_expr_for_b) = if left_from_a && right_from_b {
+                    (&cmp.left, &cmp.right)
+                } else if left_from_b && right_from_a {
+                    (&cmp.right, &cmp.left)
+                } else {
+                    continue;
+                };
+
+                // Try to derive a DerivedKeyExpr from key_expr_for_b
+                // Map variables to argument positions in atom_b
+                let atom_b = match &body[idx_b] {
+                    Literal::Pos(BodyAtom::Atom(a)) => a,
+                    _ => continue,
+                };
+                if let Some(dk_expr) = term_to_derived_key(key_expr_for_b, &atom_b.args) {
+                    let index = build_derived_index(domain, pred_b, dk_expr);
+                    result.insert(idx_b, DerivedJoin {
+                        body_idx: idx_b,
+                        bound_key_expr: bound_expr.clone(),
+                        index,
+                    });
+                    break; // one derived join per second atom is enough
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Try to convert a term like `V3 - V4` into a `DerivedKeyExpr` using argument positions.
+/// `atom_args` are the arguments of the atom (e.g., `[V3, V4]` for `pred(V3, V4)`).
+fn term_to_derived_key(term: &Term, atom_args: &[Term]) -> Option<DerivedKeyExpr> {
+    // Map: variable -> argument position in the atom
+    let var_pos = |v: SymbolId| -> Option<usize> {
+        atom_args.iter().position(|a| matches!(a, Term::Variable(vv) if *vv == v))
+    };
+    match term {
+        Term::BinOp(BinOp::Sub, l, r) => {
+            let Term::Variable(lv) = l.as_ref() else { return None; };
+            let Term::Variable(rv) = r.as_ref() else { return None; };
+            Some(DerivedKeyExpr::ArgDiff(var_pos(*lv)?, var_pos(*rv)?))
+        }
+        Term::BinOp(BinOp::Add, l, r) => {
+            let Term::Variable(lv) = l.as_ref() else { return None; };
+            let Term::Variable(rv) = r.as_ref() else { return None; };
+            Some(DerivedKeyExpr::ArgSum(var_pos(*lv)?, var_pos(*rv)?))
+        }
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
