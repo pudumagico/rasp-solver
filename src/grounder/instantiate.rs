@@ -306,7 +306,8 @@ fn enumerate_body(
                         for &ti in indices {
                             let tuple = &tuples[ti];
                             let saved = trail.len();
-                            if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
+                            if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
+                                && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
                                 enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                             }
                             undo_trail(bindings, trail, saved);
@@ -336,7 +337,8 @@ fn enumerate_body(
                 for &ti in indices {
                     let tuple = &tuples[ti];
                     let saved = trail.len();
-                    if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
+                    if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
+                        && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
                         enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
@@ -345,7 +347,8 @@ fn enumerate_body(
                 for tuple in tuples {
                     if tuple.len() != atom.args.len() { continue; }
                     let saved = trail.len();
-                    if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
+                    if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
+                        && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
                         enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
@@ -483,6 +486,55 @@ fn try_solve_binop_side(
             return Some((*v, Value::Int(solved)));
         }
     None
+}
+
+/// Eagerly evaluate remaining comparisons and solve equalities with one free variable.
+/// Binds solved variables (pushed to trail) so later literals can verify them.
+/// Returns false if any fully-evaluable comparison fails (enabling early pruning).
+fn check_eager_comparisons(
+    body: &[Literal],
+    from_idx: usize,
+    bindings: &mut Bindings,
+    const_map: &HashMap<SymbolId, Value>,
+    trail: &mut Vec<SymbolId>,
+) -> bool {
+    // Single pass: check/solve comparisons. If a variable is solved, do one
+    // more pass to catch newly-evaluable comparisons.
+    let mut solved = false;
+    for lit in &body[from_idx..] {
+        let (cmp, negated) = match lit {
+            Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
+            Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
+            _ => continue,
+        };
+        let lv = eval_term(&cmp.left, bindings, const_map);
+        let rv = eval_term(&cmp.right, bindings, const_map);
+        if let (Some(l), Some(r)) = (lv, rv) {
+            if negated == eval_comp(cmp.op, &l, &r) { return false; }
+        } else if !negated && cmp.op == CompOp::Eq
+            && let Some((var, val)) = try_solve_equality(cmp, bindings, const_map) {
+                trail.push(var);
+                bindings.insert(var, val);
+                solved = true;
+        }
+    }
+    if !solved { return true; }
+    // Second pass: check comparisons newly evaluable after solving a variable.
+    // The solved equality itself is guaranteed to hold (by construction),
+    // and comparisons already evaluated in pass 1 haven't changed.
+    // Only check comparisons that were NOT evaluable before but are now.
+    for lit in &body[from_idx..] {
+        let (cmp, negated) = match lit {
+            Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
+            Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
+            _ => continue,
+        };
+        // Skip equalities that we might have just solved (guaranteed to hold)
+        if !negated && cmp.op == CompOp::Eq { continue; }
+        if let (Some(l), Some(r)) = (eval_term(&cmp.left, bindings, const_map), eval_term(&cmp.right, bindings, const_map))
+            && negated == eval_comp(cmp.op, &l, &r) { return false; }
+    }
+    true
 }
 
 fn undo_trail(bindings: &mut Bindings, trail: &mut Vec<SymbolId>, saved: usize) {
@@ -833,5 +885,81 @@ mod tests {
         bindings.insert(x, Value::Int(3));
         let term = Term::BinOp(BinOp::Add, Box::new(Term::Variable(x)), Box::new(Term::Integer(1)));
         assert_eq!(eval_term(&term, &bindings, &HashMap::new()), Some(Value::Int(4)));
+    }
+
+    #[test]
+    fn solve_equality_nested_expr() {
+        // Test: A*10+B = C  where A=9, B bound, C unbound
+        // Parses as: BinOp(Add, BinOp(Mul, A, 10), B) = C
+        // try_solve_equality should solve C = 9*10+5 = 95
+        let mut interner = Interner::new();
+        let prog = parser::parse("p :- A*10+B = C.", &mut interner).unwrap();
+        let ast::Statement::Rule(rule) = &prog.statements[0] else { panic!() };
+        let cmp = match &rule.body[0] {
+            Literal::Pos(BodyAtom::Comparison(c)) => c,
+            _ => panic!("expected comparison"),
+        };
+        let a = interner.intern("A");
+        let b = interner.intern("B");
+        let c = interner.intern("C");
+        let mut bindings = Bindings::new();
+        bindings.insert(a, Value::Int(9));
+        bindings.insert(b, Value::Int(5));
+        let result = try_solve_equality(cmp, &bindings, &HashMap::new());
+        assert_eq!(result, Some((c, Value::Int(95))));
+    }
+
+    #[test]
+    fn solve_sendmoremoney_equality() {
+        // Test the SEND+MORE=MONEY equality: S*1000+E*100+N*10+D + M*1000+O*100+R*10+E = M*10000+O*1000+N*100+E*10+Y
+        // With all vars bound except Y, try_solve_equality should compute Y
+        let mut interner = Interner::new();
+        let prog = parser::parse(
+            "p :- S*1000+E*100+N*10+D + M*1000+O*100+R*10+E = M*10000+O*1000+N*100+E*10+Y.",
+            &mut interner,
+        ).unwrap();
+        let ast::Statement::Rule(rule) = &prog.statements[0] else { panic!() };
+        let cmp = match &rule.body[0] {
+            Literal::Pos(BodyAtom::Comparison(c)) => c,
+            _ => panic!("expected comparison"),
+        };
+        // SEND=9567, MORE=1085, MONEY=10652
+        // S=9,E=5,N=6,D=7,M=1,O=0,R=8,Y=2
+        let mut bindings = Bindings::new();
+        for (name, val) in [("S",9),("E",5),("N",6),("D",7),("M",1),("O",0),("R",8)] {
+            bindings.insert(interner.intern(name), Value::Int(val));
+        }
+        let y = interner.intern("Y");
+        let result = try_solve_equality(cmp, &bindings, &HashMap::new());
+        assert_eq!(result, Some((y, Value::Int(2))));
+    }
+
+    #[test]
+    fn eager_check_solves_and_prunes() {
+        // Test that check_eager_comparisons solves for Y and prunes bad combos
+        let mut interner = Interner::new();
+        let prog = parser::parse(
+            "p :- X + Y = 10, X > 0.",
+            &mut interner,
+        ).unwrap();
+        let ast::Statement::Rule(rule) = &prog.statements[0] else { panic!() };
+        let x = interner.intern("X");
+        let y = interner.intern("Y");
+
+        // X=3, Y unbound. Eager check should solve Y=7 and pass X>0.
+        let mut bindings = Bindings::new();
+        bindings.insert(x, Value::Int(3));
+        let mut trail = Vec::new();
+        let result = check_eager_comparisons(&rule.body, 0, &mut bindings, &HashMap::new(), &mut trail);
+        assert!(result);
+        assert_eq!(bindings.get(&y), Some(&Value::Int(7)));
+        assert_eq!(trail, vec![y]);
+
+        // X=0, Y unbound. Eager check should solve Y=10 but then X>0 fails.
+        let mut bindings2 = Bindings::new();
+        bindings2.insert(x, Value::Int(0));
+        let mut trail2 = Vec::new();
+        let result2 = check_eager_comparisons(&rule.body, 0, &mut bindings2, &HashMap::new(), &mut trail2);
+        assert!(!result2);
     }
 }

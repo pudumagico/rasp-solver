@@ -27,6 +27,9 @@
   - Multi-argument indexing for grounder joins (per-arg hash index, most selective filter)
   - Vec-backed variable bindings (O(1) lookup/insert/remove, no hashing)
   - Comparison-driven variable binding (solve equalities to bind free variables before joins)
+  - Eager comparison evaluation (prune branches early when comparisons can be evaluated)
+  - Eager equality solving (solve equalities with one free variable to avoid enumeration)
+  - Conjunctive body pool expansion (`p(a;b)` in body = `p(a), p(b)`)
   - Symmetry breaking: lex-leader constraints for uniform 2-arg choice predicates
 - [x] CDCL Solver: two-watched-literal BCP, first-UIP, VSIDS + phase saving, Luby restarts
   - Domain-aware initial polarity (choice atoms → false, derived atoms → true)
@@ -43,7 +46,7 @@
   - Iterative model enumeration for optimal cost
 
 ## Tests & Benchmarks
-- **204 tests** (77 unit + 127 integration), all passing
+- **207 tests** (80 unit + 127 integration), all passing
 - **16 benchmark instances** across 8 problem types
 - GitHub Actions CI
 - Oracle comparison + benchmark scripts
@@ -70,3 +73,5 @@
 - [x] Multi-argument indexing for grounder joins
 - [x] Symmetry breaking for pigeonhole-type problems
 - [x] pigeonhole_9_8 benchmark solved (3ms with symmetry breaking)
+- [x] Eager comparison evaluation + equality solving for cryptarithmetic-style rules (~4s for SEND+MORE=MONEY)
+- [x] Fixed body pool expansion (conjunctive, not cross-product)

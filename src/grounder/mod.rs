@@ -70,22 +70,16 @@ fn expand_pools(program: &Program, const_map: &HashMap<SymbolId, Value>) -> Prog
     Program { statements: stmts }
 }
 
-/// Expand ranges in body literals.
+/// Expand pools/ranges in body literals.
+/// Body pools are conjunctive: `p(a;b)` means `p(a), p(b)` — all variants
+/// are included in a single body (not a cross-product of alternatives).
 fn expand_body_ranges(body: &[ast::Literal], const_map: &HashMap<SymbolId, Value>) -> Vec<Vec<ast::Literal>> {
-    let mut result = vec![Vec::new()];
+    let mut result = Vec::new();
     for lit in body {
         let expanded = expand_literal_ranges(lit, const_map);
-        let mut new_result = Vec::new();
-        for existing in &result {
-            for exp in &expanded {
-                let mut combined = existing.clone();
-                combined.push(exp.clone());
-                new_result.push(combined);
-            }
-        }
-        result = new_result;
+        result.extend(expanded);
     }
-    result
+    vec![result]
 }
 
 /// Expand ranges within a single literal.
