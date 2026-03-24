@@ -24,6 +24,8 @@
   - Bidirectional staircase encoding (completion constraints for aggregate support)
   - Classical negation desugared to `__neg_` predicates + consistency constraints
   - `#show` with computed terms and conditions
+  - Multi-argument indexing for grounder joins (per-arg hash index, most selective filter)
+  - Symmetry breaking: lex-leader constraints for uniform 2-arg choice predicates
 - [x] CDCL Solver: two-watched-literal BCP, first-UIP, VSIDS + phase saving, Luby restarts
   - Learned clause GC (activity-based)
   - Multi-model enumeration (`-n N`)
@@ -37,7 +39,7 @@
   - Iterative model enumeration for optimal cost
 
 ## Tests & Benchmarks
-- **202 tests** (75 unit + 127 integration), all passing
+- **204 tests** (77 unit + 127 integration), all passing
 - **16 benchmark instances** across 8 problem types
 - GitHub Actions CI
 - Oracle comparison + benchmark scripts
@@ -48,7 +50,10 @@
 | queens_8 | 8-Queens | 13ms | SAT |
 | queens_12 | 12-Queens | 18ms | SAT |
 | queens_16 | 16-Queens | 35ms | SAT |
-| pigeonhole_7_6 | 7→6 holes | 92ms | UNSAT |
+| queens_50 | 50-Queens | 1.3s | SAT |
+| queens_100 | 100-Queens | 22s | SAT |
+| pigeonhole_7_6 | 7→6 holes | 3ms | UNSAT |
+| pigeonhole_9_8 | 9→8 holes | 3ms | UNSAT |
 | graph_color_3 | 3-coloring 6n | 9ms | SAT |
 | hamiltonian | Ham. cycle 4n | 8ms | SAT |
 | schur_4_9 | Schur(4,9) | 14ms | SAT |
@@ -58,4 +63,6 @@
 
 ## Remaining
 - [ ] Cost-bound pruning during optimization search (currently enumerates all models)
-- [ ] Larger competition instances for stress testing
+- [x] Multi-argument indexing for grounder joins
+- [x] Symmetry breaking for pigeonhole-type problems
+- [x] pigeonhole_9_8 benchmark solved (3ms with symmetry breaking)

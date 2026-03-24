@@ -214,6 +214,9 @@ fn evaluate_stratum(
         all_rules.extend(ground_rules);
     }
 
+    // 1b. Add symmetry breaking constraints for uniform 2-arg choice predicates
+    add_symmetry_breaking(all_rules, atom_table, program);
+
     // 2. Build domain = facts + choice-defined atoms (for positive matching)
     let mut domain = facts.clone();
     let mut domain_known = fact_set_from_store(&domain);
@@ -233,6 +236,7 @@ fn evaluate_stratum(
     while changed && iterations < MAX_ITERATIONS {
         changed = false;
         iterations += 1;
+        let domain_idx = instantiate::build_arg_index(&domain);
 
         for rule in &normal_rules {
             let has_agg = rule.body.iter().any(|l| matches!(l,
@@ -246,15 +250,13 @@ fn evaluate_stratum(
             } else {
                 None
             };
-            let ground_rules = instantiate::instantiate_rule_with_domain(
-                &rule.head, &rule.body, facts, &domain, atom_table, const_map, agg_ctx,
+            let ground_rules = instantiate::instantiate_rule_with_index(
+                &rule.head, &rule.body, facts, &domain, atom_table, const_map, agg_ctx, &domain_idx,
             );
             for gr in ground_rules {
                 let key = rule_key(&gr);
                 if !seen_rules.insert(key) { continue; }
 
-                // Only add head to facts if ALL body_pos atoms are in the domain
-                // (prevents premature fact addition for conditional literal rules)
                 let body_satisfiable = gr.body_pos.iter().all(|bp| {
                     let a = atom_table.resolve(*bp);
                     domain_known.get(&a.predicate).is_some_and(|s| s.contains(&a.args))
@@ -281,7 +283,8 @@ fn evaluate_stratum(
         }
     }
 
-    // Ground constraints
+    // Ground constraints — build index once for the final domain
+    let domain_idx = instantiate::build_arg_index(&domain);
     for c in &constraints {
         let has_agg = c.body.iter().any(|l| matches!(l,
             ast::Literal::Pos(ast::BodyAtom::Aggregate(_)) |
@@ -294,8 +297,145 @@ fn evaluate_stratum(
         } else {
             None
         };
-        let ground_rules = instantiate::instantiate_constraint(&c.body, facts, &domain, atom_table, const_map, agg_ctx);
+        let ground_rules = instantiate::instantiate_constraint_with_index(&c.body, facts, &domain, atom_table, const_map, agg_ctx, &domain_idx);
         all_rules.extend(ground_rules);
+    }
+}
+
+/// Detect symmetric 2-arg choice predicates and add lex-leader ordering constraints.
+/// Valid when the first argument is used only in `!=` comparisons in constraints
+/// (i.e., first-arg values are interchangeable). Adds for consecutive first-arg
+/// values a_i < a_{i+1}: `:- pred(a_{i+1}, h1), pred(a_i, h2)` where h1 < h2.
+fn add_symmetry_breaking(
+    rules: &mut Vec<GroundRule>,
+    atom_table: &mut AtomTable,
+    program: &ast::Program,
+) {
+    // Collect all choice-head atom ids grouped by predicate
+    let mut choice_preds: HashMap<SymbolId, Vec<AtomId>> = HashMap::new();
+    for rule in rules.iter() {
+        if let RuleHead::Choice(heads) = &rule.head {
+            for &id in heads {
+                let atom = atom_table.resolve(id);
+                if atom.args.len() == 2 {
+                    choice_preds.entry(atom.predicate).or_default().push(id);
+                }
+            }
+        }
+    }
+
+    for (&pred, atom_ids) in &choice_preds {
+        if !first_arg_symmetric(pred, program) { continue; }
+
+        // Group by first argument
+        let mut by_first: HashMap<&Value, Vec<(&Value, AtomId)>> = HashMap::new();
+        for &id in atom_ids {
+            let atom = atom_table.resolve(id);
+            by_first.entry(&atom.args[0]).or_default().push((&atom.args[1], id));
+        }
+
+        let mut first_args: Vec<&Value> = by_first.keys().copied().collect();
+        first_args.sort();
+        if first_args.len() < 2 { continue; }
+
+        // All groups must have the same set of second-arg values
+        let reference_seconds: HashSet<&Value> = by_first[first_args[0]].iter().map(|(v, _)| *v).collect();
+        if !first_args.iter().all(|k| {
+            let secs: HashSet<&Value> = by_first[k].iter().map(|(v, _)| *v).collect();
+            secs == reference_seconds
+        }) { continue; }
+
+        let mut lookup: HashMap<(&Value, &Value), AtomId> = HashMap::new();
+        for &id in atom_ids {
+            let atom = atom_table.resolve(id);
+            lookup.insert((&atom.args[0], &atom.args[1]), id);
+        }
+
+        let mut seconds: Vec<&Value> = reference_seconds.into_iter().collect();
+        seconds.sort();
+
+        for w in first_args.windows(2) {
+            let (a_i, a_next) = (w[0], w[1]);
+            for (si, &h1) in seconds.iter().enumerate() {
+                for &h2 in &seconds[si + 1..] {
+                    let id_next_h1 = lookup[&(a_next, h1)];
+                    let id_i_h2 = lookup[&(a_i, h2)];
+                    rules.push(GroundRule {
+                        head: RuleHead::Constraint,
+                        body_pos: vec![id_next_h1, id_i_h2],
+                        body_neg: vec![],
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Check that the first argument of a 2-arg predicate is symmetric:
+/// in all constraints mentioning this predicate, the first arg only appears
+/// in `!=` comparisons with other first-arg variables of the same predicate,
+/// never in arithmetic expressions.
+fn first_arg_symmetric(pred: SymbolId, program: &ast::Program) -> bool {
+    for stmt in &program.statements {
+        let body = match stmt {
+            ast::Statement::Constraint(c) => &c.body,
+            _ => continue,
+        };
+        // Collect which variables appear as first arg of our predicate
+        let mut first_arg_vars: HashSet<SymbolId> = HashSet::new();
+        let mut mentions_pred = false;
+        for lit in body {
+            if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = lit
+                && a.predicate == pred && a.args.len() == 2 {
+                    mentions_pred = true;
+                    if let Term::Variable(v) = &a.args[0] {
+                        first_arg_vars.insert(*v);
+                    }
+                }
+        }
+        if !mentions_pred { continue; }
+        // Check that first-arg variables only appear in our predicate's first arg
+        // or in `!=` comparisons with other first-arg vars of the same predicate.
+        // If they appear in ANY other predicate or arithmetic, symmetry is broken.
+        for lit in body {
+            match lit {
+                ast::Literal::Pos(ast::BodyAtom::Comparison(cmp)) | ast::Literal::Neg(ast::BodyAtom::Comparison(cmp)) => {
+                    let lv = term_vars(&cmp.left);
+                    let rv = term_vars(&cmp.right);
+                    let all_vars: HashSet<SymbolId> = lv.union(&rv).copied().collect();
+                    if all_vars.is_disjoint(&first_arg_vars) { continue; }
+                    if cmp.op != ast::CompOp::Neq { return false; }
+                    if !matches!(&cmp.left, Term::Variable(v) if first_arg_vars.contains(v)) { return false; }
+                    if !matches!(&cmp.right, Term::Variable(v) if first_arg_vars.contains(v)) { return false; }
+                }
+                ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) => {
+                    if a.predicate == pred { continue; }
+                    // First-arg vars appearing in a DIFFERENT predicate breaks symmetry
+                    for arg in &a.args {
+                        let vars = term_vars(arg);
+                        if !vars.is_disjoint(&first_arg_vars) { return false; }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+fn term_vars(t: &Term) -> HashSet<SymbolId> {
+    let mut vars = HashSet::new();
+    collect_vars(t, &mut vars);
+    vars
+}
+
+fn collect_vars(t: &Term, vars: &mut HashSet<SymbolId>) {
+    match t {
+        Term::Variable(v) => { vars.insert(*v); }
+        Term::BinOp(_, l, r) => { collect_vars(l, vars); collect_vars(r, vars); }
+        Term::UnaryMinus(inner) => { collect_vars(inner, vars); }
+        Term::Function(_, args) => { for a in args { collect_vars(a, vars); } }
+        _ => {}
     }
 }
 
