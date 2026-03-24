@@ -86,6 +86,8 @@ pub enum Term {
     Function(SymbolId, Vec<Term>),
     BinOp(BinOp, Box<Term>, Box<Term>),
     UnaryMinus(Box<Term>),
+    Abs(Box<Term>),
+    Pool(Vec<Term>),
     Range(Box<Term>, Box<Term>),
     Anonymous,
 }

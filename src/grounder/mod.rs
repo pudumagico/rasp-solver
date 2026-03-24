@@ -172,17 +172,24 @@ fn expand_term_list_ranges(terms: &[Term], const_map: &HashMap<SymbolId, Value>)
     result
 }
 
-/// Expand a single term: Range(a,b) → [Integer(a), ..., Integer(b)], others → [self]
+/// Expand a single term: Range(a,b) → [Integer(a), ..., Integer(b)],
+/// Pool([t1,t2,...]) → [t1, t2, ...] (recursively expanded), others → [self]
 fn expand_single_term(term: &Term, const_map: &HashMap<SymbolId, Value>) -> Vec<Term> {
-    if let Term::Range(lo, hi) = term {
-        let empty = instantiate::Bindings::new();
-        let lo_val = eval_term(lo, &empty, const_map);
-        let hi_val = eval_term(hi, &empty, const_map);
-        if let (Some(Value::Int(a)), Some(Value::Int(b))) = (lo_val, hi_val) {
-            return (a..=b).map(Term::Integer).collect();
+    match term {
+        Term::Range(lo, hi) => {
+            let empty = instantiate::Bindings::new();
+            let lo_val = eval_term(lo, &empty, const_map);
+            let hi_val = eval_term(hi, &empty, const_map);
+            if let (Some(Value::Int(a)), Some(Value::Int(b))) = (lo_val, hi_val) {
+                return (a..=b).map(Term::Integer).collect();
+            }
+            vec![term.clone()]
         }
+        Term::Pool(terms) => terms.iter()
+            .flat_map(|t| expand_single_term(t, const_map))
+            .collect(),
+        _ => vec![term.clone()],
     }
-    vec![term.clone()]
 }
 
 /// Collect #const definitions into a map.

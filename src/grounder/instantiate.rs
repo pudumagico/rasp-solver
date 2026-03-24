@@ -45,6 +45,7 @@ pub fn build_arg_index(store: &FactStore) -> ArgIndex {
         let arity = tuples.first().map_or(0, |t| t.len());
         let mut per_arg: Vec<HashMap<Value, Vec<usize>>> = vec![HashMap::new(); arity];
         for (ti, tuple) in tuples.iter().enumerate() {
+            if tuple.len() != arity { continue; }
             for (ai, val) in tuple.iter().enumerate() {
                 per_arg[ai].entry(val.clone()).or_default().push(ti);
             }
@@ -513,6 +514,10 @@ pub fn eval_term(term: &Term, bindings: &Bindings, const_map: &HashMap<SymbolId,
             let Value::Int(v) = eval_term(inner, bindings, const_map)? else { return None; };
             Some(Value::Int(-v))
         }
+        Term::Abs(inner) => {
+            let Value::Int(v) = eval_term(inner, bindings, const_map)? else { return None; };
+            Some(Value::Int(v.abs()))
+        }
         Term::Function(name, args) => {
             if args.is_empty() {
                 Some(Value::Sym(*name))
@@ -520,7 +525,7 @@ pub fn eval_term(term: &Term, bindings: &Bindings, const_map: &HashMap<SymbolId,
                 None
             }
         }
-        Term::Range(..) | Term::Anonymous => None,
+        Term::Pool(..) | Term::Range(..) | Term::Anonymous => None,
     }
 }
 

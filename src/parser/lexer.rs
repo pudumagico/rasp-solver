@@ -286,6 +286,28 @@ impl<'a> Lexer<'a> {
             "max" => Ok(Token::Max),
             "minimize" | "minimise" => Ok(Token::Minimize),
             "maximize" | "maximise" => Ok(Token::Maximize),
+            // #hide — skip until next '.' and return Dot so the parser sees a no-op
+            "hide" => {
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'.' {
+                    self.advance_byte();
+                }
+                if self.pos < self.bytes.len() { self.advance_byte(); } // consume '.'
+                self.next_token()
+            }
+            // #abs → Ident("__abs"), for abs() function semantics
+            "abs" => Ok(Token::Ident(self.interner.intern("__abs"))),
+            // #mod → Backslash (modulo operator alias)
+            "mod" => Ok(Token::Backslash),
+            // #div → Slash (integer division alias)
+            "div" => Ok(Token::Slash),
+            // #edge, #heuristic, #project, #external, #domain — skip until next '.'
+            "edge" | "heuristic" | "project" | "external" | "domain" => {
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'.' {
+                    self.advance_byte();
+                }
+                if self.pos < self.bytes.len() { self.advance_byte(); }
+                self.next_token()
+            }
             _ => Err(self.error_at(start_line, start_col, &format!("unknown directive '#{word}'"))),
         }
     }

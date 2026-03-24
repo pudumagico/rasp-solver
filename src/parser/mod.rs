@@ -63,8 +63,8 @@ impl<'a> Parser<'a> {
             Token::Show => self.parse_show(),
             Token::Const => self.parse_const(),
             Token::LBrace => self.parse_choice_statement(None),
-            Token::Number(_) => {
-                // Could be `N { ... }` (choice with lower bound) or a fact like `p(1).`
+            Token::Number(_) | Token::Variable(_) => {
+                // Could be `N { ... }` (choice with lower bound) or aggregate constraint
                 self.parse_head_starting_with_term_or_ident()
             }
             Token::Ident(_) => self.parse_head_starting_with_ident(),
@@ -155,6 +155,56 @@ impl<'a> Parser<'a> {
                 let lower = Some(Term::Symbolic(atom.predicate));
                 self.parse_choice_statement(lower)
             }
+            // Conditional head: `atom : condition :- body.` → skip `:` conditions
+            Token::Colon => {
+                self.advance()?;
+                // Parse and discard condition (old gringo head conditional)
+                let _cond = self.parse_condition_list()?;
+                let body = if self.current == Token::If {
+                    self.advance()?;
+                    self.parse_body()?
+                } else {
+                    vec![]
+                };
+                self.expect(&Token::Dot)?;
+                Ok(Statement::Rule(Rule { head: vec![atom], body }))
+            }
+            // Old gringo bracket aggregate: `ident [...] ident :- body.`
+            Token::LBrack => {
+                while self.current != Token::Dot && self.current != Token::Eof {
+                    self.advance()?;
+                }
+                self.expect(&Token::Dot)?;
+                Ok(Statement::Constraint(Constraint { body: vec![] }))
+            }
+            // Lower-bounded aggregate: `L #agg{...} ...`
+            Token::Count | Token::Sum | Token::Min | Token::Max => {
+                let lower = Term::Symbolic(atom.predicate);
+                let agg = self.parse_aggregate_with_lower(CompOp::Leq, lower)?;
+                let body = if self.current == Token::If {
+                    self.advance()?;
+                    self.parse_body()?
+                } else {
+                    vec![]
+                };
+                self.expect(&Token::Dot)?;
+                Ok(Statement::Constraint(Constraint {
+                    body: {
+                        let mut b = vec![Literal::Pos(BodyAtom::Aggregate(agg))];
+                        b.extend(body);
+                        b
+                    }
+                }))
+            }
+            // Assignment: `ident = expr :- body.` used in some programs
+            Token::Slash if atom.args.is_empty() => {
+                // Could be show-like `pred/arity` but as statement — skip line
+                while self.current != Token::Dot && self.current != Token::Eof {
+                    self.advance()?;
+                }
+                self.expect(&Token::Dot)?;
+                Ok(Statement::Constraint(Constraint { body: vec![] }))
+            }
             _ => Err(self.error(format!("expected '.', ':-', '|', or '{{' after head atom, got {:?}", self.current))),
         }
     }
@@ -163,10 +213,39 @@ impl<'a> Parser<'a> {
     fn parse_head_starting_with_term_or_ident(&mut self) -> Result<Statement, ParseError> {
         let term = self.parse_term()?;
         if self.current == Token::LBrace {
-            self.parse_choice_statement(Some(term))
-        } else {
-            Err(self.error(format!("expected '{{' after number at start of statement, got {:?}", self.current)))
+            return self.parse_choice_statement(Some(term));
         }
+        // Lower-bounded aggregate constraint: `L #agg{...} [op U] :- body.`
+        // or old gringo: `L #agg[...] L :- body.`
+        if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+            let lower_op = CompOp::Leq; // L <= agg (default for inline syntax)
+            let agg = self.parse_aggregate_with_lower(lower_op, term)?;
+            let body = if self.current == Token::If {
+                self.advance()?;
+                self.parse_body()?
+            } else {
+                vec![]
+            };
+            self.expect(&Token::Dot)?;
+            return Ok(Statement::Constraint(Constraint {
+                body: {
+                    let mut b = vec![Literal::Pos(BodyAtom::Aggregate(agg))];
+                    b.extend(body);
+                    b
+                }
+            }));
+        }
+        // Old gringo bracket aggregate: `L [...] U :- body.`
+        if self.current == Token::LBrack {
+            // Skip until '.' — too complex to fully parse old gringo bracket agg
+            while self.current != Token::Dot && self.current != Token::Eof {
+                self.advance()?;
+            }
+            self.expect(&Token::Dot)?;
+            // Return empty constraint as placeholder
+            return Ok(Statement::Constraint(Constraint { body: vec![] }));
+        }
+        Err(self.error(format!("expected '{{', aggregate, or '[' after term at start of statement, got {:?}", self.current)))
     }
 
     // ── choice rule ────────────────────────────────────────
@@ -197,7 +276,8 @@ impl<'a> Parser<'a> {
 
     fn parse_choice_elements(&mut self) -> Result<Vec<ChoiceElement>, ParseError> {
         let mut elems = vec![self.parse_choice_element()?];
-        while self.current == Token::Semicolon {
+        // Accept both `;` (standard) and `,` (old gringo) as element separators
+        while self.current == Token::Semicolon || self.current == Token::Comma {
             self.advance()?;
             elems.push(self.parse_choice_element()?);
         }
@@ -206,12 +286,12 @@ impl<'a> Parser<'a> {
 
     fn parse_choice_element(&mut self) -> Result<ChoiceElement, ParseError> {
         let atom = self.parse_atom()?;
-        let condition = if self.current == Token::Colon {
+        let mut condition = Vec::new();
+        // Accept multiple `:` separated condition groups (old gringo style)
+        while self.current == Token::Colon {
             self.advance()?;
-            self.parse_condition_list()?
-        } else {
-            vec![]
-        };
+            condition.extend(self.parse_condition_list()?);
+        }
         Ok(ChoiceElement { atom, condition })
     }
 
@@ -229,21 +309,26 @@ impl<'a> Parser<'a> {
 
     fn parse_optimize(&mut self, minimize: bool) -> Result<Statement, ParseError> {
         self.advance()?; // #minimize / #maximize
-        self.expect(&Token::LBrace)?;
+        // Accept both { } (modern) and [ ] (old gringo) syntax
+        let use_brack = self.current == Token::LBrack;
+        if use_brack { self.expect(&Token::LBrack)?; } else { self.expect(&Token::LBrace)?; }
+        let close = if use_brack { Token::RBrack } else { Token::RBrace };
         let mut elements = Vec::new();
-        if self.current != Token::RBrace {
+        if self.current != close {
             elements.push(self.parse_optimize_element()?);
             while self.current == Token::Semicolon {
                 self.advance()?;
                 elements.push(self.parse_optimize_element()?);
             }
         }
-        self.expect(&Token::RBrace)?;
+        self.expect(&close)?;
         self.expect(&Token::Dot)?;
         Ok(Statement::Optimize(OptimizeDirective { minimize, elements }))
     }
 
-    /// Parse `W @ P[,T1,...] : condition` or `W[,T1,...] : condition`
+    /// Parse optimize element in modern or old gringo format.
+    /// Modern: `W @ P, T1, ... : condition`
+    /// Old gringo: `condition_lit : condition_lit2 = W` (weight at end after `=`)
     fn parse_optimize_element(&mut self) -> Result<OptimizeElement, ParseError> {
         let weight = self.parse_term()?;
         // Optional priority after @
@@ -262,13 +347,45 @@ impl<'a> Parser<'a> {
                 terms.push(self.parse_term()?);
             }
         }
-        let condition = if self.current == Token::Colon {
+        let mut condition = Vec::new();
+        // Accept multiple `:` separated condition groups (old gringo)
+        while self.current == Token::Colon {
             self.advance()?;
-            self.parse_condition_list()?
-        } else {
-            vec![]
-        };
+            if self.current == Token::Eq { break; }
+            condition.extend(self.parse_condition_list()?);
+        }
+        // Old gringo: `lit : lit2 = W[@P]` — the "weight" we parsed is actually the first
+        // condition literal, and the real weight comes after `=`
+        if self.current == Token::Eq {
+            self.advance()?;
+            let real_weight = self.parse_term()?;
+            let real_priority = if self.current == Token::At {
+                self.advance()?;
+                Some(self.parse_term()?)
+            } else {
+                priority
+            };
+            let mut full_condition = condition;
+            if let Some(lit) = self.term_to_literal(&weight) {
+                full_condition.insert(0, lit);
+            }
+            for t in &terms {
+                if let Some(lit) = self.term_to_literal(t) {
+                    full_condition.push(lit);
+                }
+            }
+            return Ok(OptimizeElement { weight: real_weight, priority: real_priority, terms: vec![], condition: full_condition });
+        }
         Ok(OptimizeElement { weight, priority, terms, condition })
+    }
+
+    /// Try to convert a parsed term back into a body literal (for old gringo rewrite).
+    fn term_to_literal(&self, term: &Term) -> Option<Literal> {
+        match term {
+            Term::Symbolic(s) => Some(Literal::Pos(BodyAtom::Atom(Atom { predicate: *s, args: vec![] }))),
+            Term::Function(name, args) => Some(Literal::Pos(BodyAtom::Atom(Atom { predicate: *name, args: args.clone() }))),
+            _ => None,
+        }
     }
 
     fn parse_show(&mut self) -> Result<Statement, ParseError> {
@@ -381,6 +498,13 @@ impl<'a> Parser<'a> {
         if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
             return Ok(BodyAtom::Aggregate(self.parse_aggregate()?));
         }
+        // Bare `{ ... }` / `[ ... ]` in body → implicit `#count`
+        if self.current == Token::LBrace {
+            return Ok(BodyAtom::Aggregate(self.parse_bare_brace_aggregate()?));
+        }
+        if self.current == Token::LBrack {
+            return Ok(BodyAtom::Aggregate(self.parse_bare_bracket_aggregate()?));
+        }
         // Classical negation in body: `-ident(...)` → rewrite to `__neg_ident(...)`
         if self.current == Token::Minus && self.lexer.peek_is_ident() {
             self.advance()?; // consume -
@@ -403,10 +527,24 @@ impl<'a> Parser<'a> {
         if let Token::Ident(id) = self.current.clone() {
             self.advance()?;
             if self.current == Token::LParen {
-                // Definitely an atom: ident(args)
+                // Could be atom: ident(args) or function term in comparison
                 self.advance()?;
                 let args = self.parse_term_list()?;
                 self.expect(&Token::RParen)?;
+                // Check if a comparison follows — if so, treat as function term
+                if let Some(op) = self.try_comp_op() {
+                    let name = self.lexer.interner().resolve(id);
+                    let left = if (name == "abs" || name == "__abs") && args.len() == 1 {
+                        Term::Abs(Box::new(args.into_iter().next().unwrap()))
+                    } else {
+                        Term::Function(id, args)
+                    };
+                    if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+                        return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(op, left)?));
+                    }
+                    let right = self.parse_term()?;
+                    return Ok(BodyAtom::Comparison(Comparison { left, op, right }));
+                }
                 let atom = Atom { predicate: id, args };
                 // Check for conditional literal: `p(X) : q(X), ...`
                 if self.current == Token::Colon {
@@ -418,10 +556,38 @@ impl<'a> Parser<'a> {
             }
             // Bare ident — could be `pred` (0-arity atom) or start of comparison.
             let term = self.finish_term_from_ident(id)?;
+            // Old gringo: `ident #agg[...]` / `ident {` without explicit operator → implicit <=
+            if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+                return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(CompOp::Leq, term)?));
+            }
+            if self.current == Token::LBrace || self.current == Token::LBrack {
+                let mut agg = if self.current == Token::LBrack {
+                    self.parse_bare_bracket_aggregate()?
+                } else {
+                    self.parse_bare_brace_aggregate()?
+                };
+                agg.lower = Some((CompOp::Geq, term));
+                return Ok(BodyAtom::Aggregate(agg));
+            }
             if let Some(op) = self.try_comp_op() {
                 // Check if RHS is an aggregate: `term op #agg{...}` → lower-bounded aggregate
                 if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
                     return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(op, term)?));
+                }
+                // `term op [...]` or `term op {...}` → count aggregate
+                if self.current == Token::LBrack || self.current == Token::LBrace {
+                    let mut agg = if self.current == Token::LBrack {
+                        self.parse_bare_bracket_aggregate()?
+                    } else {
+                        self.parse_bare_brace_aggregate()?
+                    };
+                    let flipped = match op {
+                        CompOp::Lt => CompOp::Gt, CompOp::Leq => CompOp::Geq,
+                        CompOp::Gt => CompOp::Lt, CompOp::Geq => CompOp::Leq,
+                        other => other,
+                    };
+                    agg.lower = Some((flipped, term));
+                    return Ok(BodyAtom::Aggregate(agg));
                 }
                 let right = self.parse_term()?;
                 return Ok(BodyAtom::Comparison(Comparison { left: term, op, right }));
@@ -440,10 +606,38 @@ impl<'a> Parser<'a> {
         }
         // Not starting with ident — could be a comparison or lower-bounded aggregate.
         let left = self.parse_term()?;
+        // Old gringo: `L #agg[...]` or `L {...}` without explicit operator → implicit <=
+        if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
+            return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(CompOp::Leq, left)?));
+        }
+        if self.current == Token::LBrace || self.current == Token::LBrack {
+            let mut agg = if self.current == Token::LBrack {
+                self.parse_bare_bracket_aggregate()?
+            } else {
+                self.parse_bare_brace_aggregate()?
+            };
+            agg.lower = Some((CompOp::Geq, left));
+            return Ok(BodyAtom::Aggregate(agg));
+        }
         if let Some(op) = self.try_comp_op() {
             // Check if RHS is an aggregate: `term op #agg{...}` → lower-bounded aggregate
             if matches!(self.current, Token::Count | Token::Sum | Token::Min | Token::Max) {
                 return Ok(BodyAtom::Aggregate(self.parse_aggregate_with_lower(op, left)?));
+            }
+            // Old gringo: `term op [...]` / `term op {...}` → count aggregate
+            if self.current == Token::LBrack || self.current == Token::LBrace {
+                let mut agg = if self.current == Token::LBrack {
+                    self.parse_bare_bracket_aggregate()?
+                } else {
+                    self.parse_bare_brace_aggregate()?
+                };
+                let flipped = match op {
+                    CompOp::Lt => CompOp::Gt, CompOp::Leq => CompOp::Geq,
+                    CompOp::Gt => CompOp::Lt, CompOp::Geq => CompOp::Leq,
+                    other => other,
+                };
+                agg.lower = Some((flipped, left));
+                return Ok(BodyAtom::Aggregate(agg));
             }
             let right = self.parse_term()?;
             Ok(BodyAtom::Comparison(Comparison { left, op, right }))
@@ -467,6 +661,36 @@ impl<'a> Parser<'a> {
     }
 
     // ── aggregates ─────────────────────────────────────────
+
+    /// Parse bare `{ ... }` as `#count { ... }` (implicit count aggregate in body)
+    fn parse_bare_brace_aggregate(&mut self) -> Result<Aggregate, ParseError> {
+        self.expect(&Token::LBrace)?;
+        let elements = self.parse_agg_elements()?;
+        self.expect(&Token::RBrace)?;
+        let upper = if let Some(op) = self.try_comp_op() {
+            Some((op, self.parse_term()?))
+        } else if matches!(self.current, Token::Number(_) | Token::Variable(_) | Token::Ident(_) | Token::Minus) {
+            Some((CompOp::Leq, self.parse_term()?))
+        } else {
+            None
+        };
+        Ok(Aggregate { function: AggFunction::Count, elements, lower: None, upper })
+    }
+
+    /// Parse old gringo `[...]` as `#count [...]`
+    fn parse_bare_bracket_aggregate(&mut self) -> Result<Aggregate, ParseError> {
+        self.expect(&Token::LBrack)?;
+        let elements = self.parse_agg_elements()?;
+        self.expect(&Token::RBrack)?;
+        let upper = if let Some(op) = self.try_comp_op() {
+            Some((op, self.parse_term()?))
+        } else if matches!(self.current, Token::Number(_) | Token::Variable(_) | Token::Ident(_)) {
+            Some((CompOp::Leq, self.parse_term()?))
+        } else {
+            None
+        };
+        Ok(Aggregate { function: AggFunction::Count, elements, lower: None, upper })
+    }
 
     /// Parse an aggregate with a known lower bound: `L op #agg{...} [op U]`
     /// The `op` is from the perspective of the left term (e.g., `2 <= #count{...}`
@@ -495,14 +719,18 @@ impl<'a> Parser<'a> {
             _ => return Err(self.error("expected aggregate function".to_string())),
         };
         self.advance()?;
-        self.expect(&Token::LBrace)?;
+        // Accept both { } (modern) and [ ] (old gringo) syntax
+        let use_brack = self.current == Token::LBrack;
+        if use_brack { self.expect(&Token::LBrack)?; } else { self.expect(&Token::LBrace)?; }
+        let close = if use_brack { Token::RBrack } else { Token::RBrace };
         let elements = self.parse_agg_elements()?;
-        self.expect(&Token::RBrace)?;
-        // Parse optional bounds: `op term` on left (lower) and/or right (upper).
-        // Standard form: `L op #count{...} op U` but we handle postfix: `#count{...} op U`.
-        // For simplicity, parse right-side bound here.
+        self.expect(&close)?;
+        // Parse optional upper bound: `op term` or just `term` (old gringo: implicit <=)
         let upper = if let Some(op) = self.try_comp_op() {
             Some((op, self.parse_term()?))
+        } else if matches!(self.current, Token::Number(_) | Token::Variable(_) | Token::Ident(_)) {
+            // Old gringo: `L #agg[...] U` → implicit `<= U`
+            Some((CompOp::Leq, self.parse_term()?))
         } else {
             None
         };
@@ -520,12 +748,32 @@ impl<'a> Parser<'a> {
 
     fn parse_agg_element(&mut self) -> Result<AggElement, ParseError> {
         let terms = self.parse_term_list_until_colon()?;
-        let condition = if self.current == Token::Colon {
+        let mut condition = Vec::new();
+        // Parse colon-separated conditions (old gringo uses multiple `:`, modern uses `,`)
+        while self.current == Token::Colon {
             self.advance()?;
-            self.parse_condition_list()?
-        } else {
-            vec![]
-        };
+            // Check for `= Weight` (end of old-gringo element)
+            if self.current == Token::Eq { break; }
+            condition.extend(self.parse_condition_list()?);
+        }
+        // Old gringo: `= Weight[@Priority]` at the end of an element
+        if self.current == Token::Eq {
+            self.advance()?;
+            let weight = self.parse_term()?;
+            // Skip optional @Priority (not used in our aggregate representation)
+            if self.current == Token::At {
+                self.advance()?;
+                let _priority = self.parse_term()?;
+            }
+            // Rewrite: the original terms become condition, weight becomes the term
+            let mut full_condition = condition;
+            for t in &terms {
+                if let Some(lit) = self.term_to_literal(t) {
+                    full_condition.push(lit);
+                }
+            }
+            return Ok(AggElement { terms: vec![weight], condition: full_condition });
+        }
         Ok(AggElement { terms, condition })
     }
 
@@ -570,12 +818,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term_list(&mut self) -> Result<Vec<Term>, ParseError> {
-        let mut terms = vec![self.parse_term()?];
+        let mut terms = vec![self.parse_term_or_pool()?];
         while self.current == Token::Comma {
+            self.advance()?;
+            terms.push(self.parse_term_or_pool()?);
+        }
+        Ok(terms)
+    }
+
+    /// Parse a term that may contain `;`-separated alternatives (pool).
+    fn parse_term_or_pool(&mut self) -> Result<Term, ParseError> {
+        let first = self.parse_term()?;
+        if self.current != Token::Semicolon { return Ok(first); }
+        let mut terms = vec![first];
+        while self.current == Token::Semicolon {
             self.advance()?;
             terms.push(self.parse_term()?);
         }
-        Ok(terms)
+        Ok(Term::Pool(terms))
     }
 
     // ── terms (precedence climbing) ────────────────────────
@@ -628,6 +888,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Term, ParseError> {
+        // Absolute value: |expr| → Abs(expr)
+        if self.current == Token::Pipe {
+            self.advance()?;
+            let inner = self.parse_term()?;
+            self.expect(&Token::Pipe)?;
+            return Ok(Term::Abs(Box::new(inner)));
+        }
         match self.advance()? {
             Token::Number(n) => {
                 // Check for range: N..M
@@ -643,9 +910,19 @@ impl<'a> Parser<'a> {
             Token::StringLit(id) => Ok(Term::StringConst(id)),
             Token::Anonymous => Ok(Term::Anonymous),
             Token::LParen => {
-                let inner = self.parse_term()?;
+                let inner = self.parse_term_or_pool()?;
                 self.expect(&Token::RParen)?;
                 Ok(inner)
+            }
+            Token::LBrack => {
+                // Tuple syntax: [a,b,c] → Function("__tuple", [a,b,c])
+                let args = if self.current == Token::RBrack {
+                    vec![]
+                } else {
+                    self.parse_term_list()?
+                };
+                self.expect(&Token::RBrack)?;
+                Ok(Term::Function(self.lexer.interner().intern("__tuple"), args))
             }
             other => Err(self.error(format!("expected term, got {other:?}"))),
         }
@@ -658,6 +935,11 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let args = self.parse_term_list()?;
             self.expect(&Token::RParen)?;
+            // abs(expr) and __abs(expr) → Abs(expr)
+            let name = self.lexer.interner().resolve(id);
+            if (name == "abs" || name == "__abs") && args.len() == 1 {
+                return Ok(Term::Abs(Box::new(args.into_iter().next().unwrap())));
+            }
             Ok(Term::Function(id, args))
         } else if self.current == Token::DotDot {
             self.advance()?;
