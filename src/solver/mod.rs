@@ -37,8 +37,8 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
     let mut restarts = RestartPolicy::new(100);
     let mut ufs_checker = UnfoundedSetChecker::new(program, &translation.choice_atoms);
     let mut conflicts = 0u64;
+    let mut seen_atoms = Vec::new();
 
-    // Add all initial clauses
     for clause_lits in &translation.clauses {
         match clause_lits.len() {
             0 => return SolveResult::Unsatisfiable,
@@ -50,9 +50,7 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
                     LBool::Undef => assignment.assign(lit, 0, None),
                 }
             }
-            _ => {
-                clause_db.add_clause(clause_lits.clone(), false);
-            }
+            _ => { clause_db.add_clause(clause_lits.clone(), false); }
         }
     }
 
@@ -67,22 +65,22 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
                 if assignment.decision_level() == 0 {
                     return SolveResult::Unsatisfiable;
                 }
-                let (learned, bt_level) = analyze::analyze(&clause_db, &assignment, conflict);
+                seen_atoms.clear();
+                let (learned, bt_level, lbd) = analyze::analyze(&clause_db, &assignment, conflict, &mut seen_atoms);
 
-                for lit in &learned {
-                    vsids.bump(lit.atom);
-                }
+                // Reason-side VSIDS bumping: bump all atoms seen during resolution
+                for &atom in &seen_atoms { vsids.bump(atom); }
                 vsids.decay();
 
+                restarts.update_lbd(lbd);
+
                 let unassigned = assignment.backtrack_to(bt_level);
-                for atom in unassigned {
-                    vsids.insert(atom);
-                }
+                for atom in unassigned { vsids.insert(atom); }
 
                 if learned.len() == 1 {
                     assignment.assign(learned[0], 0, None);
                 } else {
-                    let cidx = clause_db.add_clause(learned.clone(), true);
+                    let cidx = clause_db.add_clause_with_lbd(learned.clone(), true, lbd);
                     assignment.assign(learned[0], bt_level, Some(cidx));
                 }
 
@@ -90,15 +88,9 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
 
                 if restarts.should_restart(conflicts) {
                     let unassigned = assignment.backtrack_to(0);
-                    for atom in unassigned {
-                        vsids.insert(atom);
-                    }
+                    for atom in unassigned { vsids.insert(atom); }
                     restarts.advance();
-
-                    // Reduce learned clauses periodically at restart
-                    if clause_db.should_reduce() {
-                        clause_db.reduce_learnt(&assignment);
-                    }
+                    if clause_db.should_reduce() { clause_db.reduce_learnt(&assignment); }
                 }
             }
             None => {
@@ -122,14 +114,9 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
                                 added_any = true;
                             }
                         } else {
-                            // Multi-literal UFS nogood (for level-0 atoms).
-                            // Always add to clause_db for watched literal propagation.
-                            // Sort so non-false literals come first for watches.
                             let mut sorted = nogood;
                             sorted.sort_by_key(|l| if assignment.value_lit(*l) == LBool::False { 1u8 } else { 0 });
                             clause_db.add_clause(sorted, true);
-                            // If all literals are currently false, backtrack to make
-                            // the clause useful for future BCP.
                             if assignment.decision_level() > 0 {
                                 let unassigned = assignment.backtrack_to(0);
                                 for atom in unassigned { vsids.insert(atom); }
@@ -160,19 +147,16 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
     }
 }
 
-/// Add a clause, checking for unit/conflict under the current assignment.
-/// Returns false if the clause causes a conflict at level 0 (UNSAT).
 fn add_clause_and_propagate(
     lits: &[Lit],
     clause_db: &mut ClauseDB,
     assignment: &mut Assignment,
 ) -> bool {
-    // Count false and find the first non-false literal
     let mut undef_count = 0;
     let mut first_undef = None;
     for &lit in lits {
         match assignment.value_lit(lit) {
-            LBool::True => return true, // clause already satisfied
+            LBool::True => return true,
             LBool::Undef => {
                 undef_count += 1;
                 if first_undef.is_none() { first_undef = Some(lit); }
@@ -181,14 +165,12 @@ fn add_clause_and_propagate(
         }
     }
     match undef_count {
-        0 => false, // all literals false → conflict
+        0 => false,
         1 => {
-            // unit clause → propagate
             assignment.assign(first_undef.unwrap(), assignment.decision_level(), None);
             true
         }
         _ => {
-            // Multi-literal clause — reorder to put non-false literals first for watches
             let mut sorted = lits.to_vec();
             sorted.sort_by_key(|l| if assignment.value_lit(*l) == LBool::False { 1 } else { 0 });
             clause_db.add_clause(sorted, true);
@@ -197,7 +179,6 @@ fn add_clause_and_propagate(
     }
 }
 
-/// Find up to `max_models` answer sets (0 = all). Returns all found models.
 pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>> {
     let mut models = Vec::new();
     let translation = translate::translate(program);
@@ -212,6 +193,7 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
     let mut restarts = RestartPolicy::new(100);
     let mut ufs_checker = UnfoundedSetChecker::new(program, &translation.choice_atoms);
     let mut conflicts = 0u64;
+    let mut seen_atoms = Vec::new();
 
     for clause_lits in &translation.clauses {
         match clause_lits.len() {
@@ -237,15 +219,17 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
             Some(conflict) => {
                 conflicts += 1;
                 if assignment.decision_level() == 0 { return models; }
-                let (learned, bt_level) = analyze::analyze(&clause_db, &assignment, conflict);
-                for lit in &learned { vsids.bump(lit.atom); }
+                seen_atoms.clear();
+                let (learned, bt_level, lbd) = analyze::analyze(&clause_db, &assignment, conflict, &mut seen_atoms);
+                for &atom in &seen_atoms { vsids.bump(atom); }
                 vsids.decay();
+                restarts.update_lbd(lbd);
                 let unassigned = assignment.backtrack_to(bt_level);
                 for atom in unassigned { vsids.insert(atom); }
                 if learned.len() == 1 {
                     assignment.assign(learned[0], 0, None);
                 } else {
-                    let cidx = clause_db.add_clause(learned.clone(), true);
+                    let cidx = clause_db.add_clause_with_lbd(learned.clone(), true, lbd);
                     assignment.assign(learned[0], bt_level, Some(cidx));
                 }
                 clause_db.decay_activities();
@@ -296,13 +280,11 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
                         assignment.assign(lit, assignment.decision_level(), None);
                     }
                     None => {
-                        // Found a model
                         let model: Vec<AtomId> = (0..translation.num_atoms)
                             .filter(|&i| assignment.value(AtomId(i)) == LBool::True)
                             .map(AtomId)
                             .collect();
 
-                        // Block this exact assignment of choice atoms
                         let blocking: Vec<Lit> = (0..translation.num_atoms)
                             .filter(|&i| translation.choice_atoms[i as usize])
                             .map(|i| {
@@ -319,14 +301,12 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
                         if max_models > 0 && models.len() >= max_models { return models; }
 
                         if blocking.is_empty() {
-                            return models; // no choice atoms → only one possible model
+                            return models;
                         }
-                        // Backtrack and add blocking clause
                         let unassigned = assignment.backtrack_to(0);
                         for atom in unassigned { vsids.insert(atom); }
-                        // Add clause, handling unit/conflict under current assignment
                         if !add_clause_and_propagate(&blocking, &mut clause_db, &mut assignment) {
-                            return models; // conflict at level 0 → no more models
+                            return models;
                         }
                     }
                 }

@@ -28,10 +28,11 @@ pub fn instantiate_rule_with_domain(
     agg_ctx: Option<&mut AggContext<'_>>,
 ) -> Vec<GroundRule> {
     let mut results = Vec::new();
-    let bindings = Bindings::new();
+    let mut bindings = Bindings::new();
+    let mut trail = Vec::new();
     let has_cond = body.iter().any(|l| matches!(l,
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
-    enumerate_body(body, 0, &bindings, domain, facts, const_map, &mut |b| {
+    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, &mut |b| {
         let ground_heads: Vec<AtomId> = heads.iter()
             .filter_map(|h| ground_atom(h, b, const_map))
             .map(|ga| atom_table.get_or_insert(ga))
@@ -65,10 +66,11 @@ pub fn instantiate_constraint(
     agg_ctx: Option<&mut AggContext<'_>>,
 ) -> Vec<GroundRule> {
     let mut results = Vec::new();
-    let bindings = Bindings::new();
+    let mut bindings = Bindings::new();
+    let mut trail = Vec::new();
     let has_cond = body.iter().any(|l| matches!(l,
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..))));
-    enumerate_body(body, 0, &bindings, domain, facts, const_map, &mut |b| {
+    enumerate_body(body, 0, &mut bindings, domain, facts, const_map, &mut trail, &mut |b| {
         let (body_pos, body_neg) = ground_body(body, b, atom_table, const_map);
         results.push(GroundRule { head: RuleHead::Constraint, body_pos, body_neg });
     });
@@ -90,8 +92,9 @@ pub fn instantiate_choice(
     const_map: &HashMap<SymbolId, Value>,
 ) -> Vec<GroundRule> {
     let mut results = Vec::new();
-    let bindings = Bindings::new();
-    enumerate_body(&choice.body, 0, &bindings, facts, facts, const_map, &mut |b| {
+    let mut bindings = Bindings::new();
+    let mut trail = Vec::new();
+    enumerate_body(&choice.body, 0, &mut bindings, facts, facts, const_map, &mut trail, &mut |b| {
         let mut head_atoms = Vec::new();
         for elem in &choice.elements {
             if elem.condition.is_empty() {
@@ -124,19 +127,20 @@ pub fn enumerate_body_public(
     const_map: &HashMap<SymbolId, Value>,
     callback: &mut impl FnMut(&Bindings),
 ) {
-    enumerate_body(body, idx, bindings, pos_domain, naf_facts, const_map, callback);
+    let mut b = bindings.clone();
+    let mut trail = Vec::new();
+    enumerate_body(body, idx, &mut b, pos_domain, naf_facts, const_map, &mut trail, callback);
 }
 
-/// Recursively enumerate all valid variable bindings for the body.
-/// `pos_domain`: used for positive body atom matching (may include choice atoms).
-/// `naf_facts`: used for NAF checks (only definite facts).
+#[allow(clippy::too_many_arguments)]
 fn enumerate_body(
     body: &[Literal],
     idx: usize,
-    bindings: &Bindings,
+    bindings: &mut Bindings,
     pos_domain: &FactStore,
     naf_facts: &FactStore,
     const_map: &HashMap<SymbolId, Value>,
+    trail: &mut Vec<SymbolId>,
     callback: &mut impl FnMut(&Bindings),
 ) {
     if idx >= body.len() {
@@ -146,33 +150,33 @@ fn enumerate_body(
     match &body[idx] {
         Literal::Pos(BodyAtom::Atom(atom)) => {
             let Some(tuples) = pos_domain.get(&atom.predicate) else { return; };
-            // Optimization: if first arg is ground, skip non-matching tuples early
             let first_ground = atom.args.first().and_then(|t| eval_term(t, bindings, const_map));
             for tuple in tuples {
                 if tuple.len() != atom.args.len() { continue; }
-                // Fast filter: check first argument before full unification
                 if let Some(ref fv) = first_ground
                     && let Some(tv) = tuple.first()
                     && fv != tv { continue; }
-                let mut new_bindings = bindings.clone();
-                if unify_args(&atom.args, tuple, &mut new_bindings, const_map) {
-                    enumerate_body(body, idx + 1, &new_bindings, pos_domain, naf_facts, const_map, callback);
+                let saved = trail.len();
+                if unify_args_trail(&atom.args, tuple, bindings, const_map, trail) {
+                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, callback);
                 }
+                undo_trail(bindings, trail, saved);
             }
         }
         Literal::Neg(BodyAtom::Atom(atom)) => {
-            // NAF: check against definite facts only (not choice atoms)
             let matches = if let Some(tuples) = naf_facts.get(&atom.predicate) {
                 tuples.iter().any(|tuple| {
                     if tuple.len() != atom.args.len() { return false; }
-                    let mut test_bindings = bindings.clone();
-                    unify_args(&atom.args, tuple, &mut test_bindings, const_map)
+                    let saved = trail.len();
+                    let ok = unify_args_trail(&atom.args, tuple, bindings, const_map, trail);
+                    undo_trail(bindings, trail, saved);
+                    ok
                 })
             } else {
                 false
             };
             if !matches {
-                enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
+                enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, callback);
             }
         }
         Literal::Pos(BodyAtom::Comparison(cmp)) | Literal::Neg(BodyAtom::Comparison(cmp)) => {
@@ -181,25 +185,26 @@ fn enumerate_body(
                 let holds = eval_comp(cmp.op, &lv, &rv);
                 let pass = if negated { !holds } else { holds };
                 if pass {
-                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
+                    enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, callback);
                 }
             }
         }
         Literal::Pos(BodyAtom::Aggregate(_)) | Literal::Neg(BodyAtom::Aggregate(_)) => {
-            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
+            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, callback);
         }
         Literal::Pos(BodyAtom::CondLiteral(..)) | Literal::Neg(BodyAtom::CondLiteral(..)) => {
-            // Conditional literals are expanded in ground_body, not during enumeration
-            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, callback);
+            enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, callback);
         }
     }
 }
 
-fn unify_args(
+/// Unify with trail: records newly bound variables for undo.
+fn unify_args_trail(
     args: &[Term],
     tuple: &[Value],
     bindings: &mut Bindings,
     const_map: &HashMap<SymbolId, Value>,
+    trail: &mut Vec<SymbolId>,
 ) -> bool {
     for (arg, val) in args.iter().zip(tuple.iter()) {
         match arg {
@@ -207,6 +212,7 @@ fn unify_args(
                 if let Some(existing) = bindings.get(v) {
                     if existing != val { return false; }
                 } else {
+                    trail.push(*v);
                     bindings.insert(*v, val.clone());
                 }
             }
@@ -221,6 +227,13 @@ fn unify_args(
         }
     }
     true
+}
+
+fn undo_trail(bindings: &mut Bindings, trail: &mut Vec<SymbolId>, saved: usize) {
+    while trail.len() > saved {
+        let var = trail.pop().unwrap();
+        bindings.remove(&var);
+    }
 }
 
 pub fn eval_term(term: &Term, bindings: &Bindings, const_map: &HashMap<SymbolId, Value>) -> Option<Value> {
@@ -283,7 +296,9 @@ fn expand_choice_condition(
     atom_table: &mut AtomTable,
     head_atoms: &mut Vec<AtomId>,
 ) {
-    enumerate_body(condition, 0, base_bindings, facts, facts, const_map, &mut |b| {
+    let mut b = base_bindings.clone();
+    let mut trail = Vec::new();
+    enumerate_body(condition, 0, &mut b, facts, facts, const_map, &mut trail, &mut |b| {
         if let Some(ga) = ground_atom(atom, b, const_map) {
             let id = atom_table.get_or_insert(ga);
             if !head_atoms.contains(&id) {
@@ -347,7 +362,9 @@ fn ground_body_cond_literals(
             // Use get_or_insert to create atoms that don't exist yet (they'll
             // have no support and be forced false by Clark's completion).
             let mut cond_atoms = Vec::new();
-            enumerate_body(condition, 0, bindings, domain, domain, const_map, &mut |cond_bindings| {
+            let mut cond_bindings_mut = bindings.clone();
+            let mut cond_trail = Vec::new();
+            enumerate_body(condition, 0, &mut cond_bindings_mut, domain, domain, const_map, &mut cond_trail, &mut |cond_bindings| {
                 if let Some(ga) = ground_atom(atom, cond_bindings, const_map) {
                     let id = atom_table.get_or_insert(ga);
                     if !cond_atoms.contains(&id) {
