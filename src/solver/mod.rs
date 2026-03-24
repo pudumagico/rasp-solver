@@ -16,12 +16,28 @@ use assignment::{Assignment, LBool};
 use clause::ClauseDB;
 use decide::VsidsHeap;
 use restart::RestartPolicy;
+use translate::Translation;
 use unfounded::UnfoundedSetChecker;
 
 #[derive(Debug)]
 pub enum SolveResult {
     Satisfiable(Vec<AtomId>),
     Unsatisfiable,
+}
+
+/// Set domain-aware initial polarities and seed VSIDS activities from clause occurrences.
+fn init_heuristics(translation: &Translation, assignment: &mut Assignment, vsids: &mut VsidsHeap) {
+    // Choice atoms prefer false (reduces search space); derived atoms prefer true
+    for i in 0..translation.num_atoms {
+        let polarity = !translation.choice_atoms[i as usize];
+        assignment.set_initial_polarity(AtomId(i), polarity);
+    }
+    // Seed activities: atoms in more clauses get higher initial activity
+    for clause_lits in &translation.clauses {
+        for lit in clause_lits {
+            vsids.bump(lit.atom);
+        }
+    }
 }
 
 pub fn solve(program: &GroundProgram) -> SolveResult {
@@ -38,6 +54,8 @@ pub fn solve(program: &GroundProgram) -> SolveResult {
     let mut ufs_checker = UnfoundedSetChecker::new(program, &translation.choice_atoms);
     let mut conflicts = 0u64;
     let mut seen_atoms = Vec::new();
+
+    init_heuristics(&translation, &mut assignment, &mut vsids);
 
     for clause_lits in &translation.clauses {
         match clause_lits.len() {
@@ -194,6 +212,8 @@ pub fn solve_many(program: &GroundProgram, max_models: usize) -> Vec<Vec<AtomId>
     let mut ufs_checker = UnfoundedSetChecker::new(program, &translation.choice_atoms);
     let mut conflicts = 0u64;
     let mut seen_atoms = Vec::new();
+
+    init_heuristics(&translation, &mut assignment, &mut vsids);
 
     for clause_lits in &translation.clauses {
         match clause_lits.len() {

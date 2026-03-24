@@ -27,6 +27,8 @@
   - Multi-argument indexing for grounder joins (per-arg hash index, most selective filter)
   - Symmetry breaking: lex-leader constraints for uniform 2-arg choice predicates
 - [x] CDCL Solver: two-watched-literal BCP, first-UIP, VSIDS + phase saving, Luby restarts
+  - Domain-aware initial polarity (choice atoms → false, derived atoms → true)
+  - Initial activity seeding from clause occurrence counts
   - Learned clause GC (activity-based)
   - Multi-model enumeration (`-n N`)
   - Blocking clause model exclusion

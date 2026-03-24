@@ -91,6 +91,10 @@ impl Assignment {
         &self.trail
     }
 
+    pub fn set_initial_polarity(&mut self, atom: AtomId, polarity: bool) {
+        self.polarities[atom.index()] = polarity;
+    }
+
     pub fn saved_polarity(&self, atom: AtomId) -> bool {
         self.polarities[atom.index()]
     }
