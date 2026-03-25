@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ground::program::{AtomTable, GroundAtom, GroundRule, RuleHead};
 use crate::interner::Interner;
@@ -278,6 +278,115 @@ pub fn enumerate_body_public(
     enumerate_body(body, idx, &mut b, pos_domain, naf_facts, const_map, &mut trail, &arg_idx, &no_dj, callback);
 }
 
+/// For a single-variable domain atom, collect values that are forbidden by `!=`
+/// comparisons and out-of-range by `>`, `<`, `>=`, `<=` comparisons in the remaining body.
+/// Returns None if no constraints apply (avoid allocating a HashSet).
+fn collect_forbidden_values(
+    body: &[Literal],
+    current_idx: usize,
+    var: SymbolId,
+    bindings: &Bindings,
+    const_map: &HashMap<SymbolId, Value>,
+    domain_values: &[Vec<Value>],
+) -> Option<HashSet<Value>> {
+    let mut forbidden = HashSet::new();
+    // Track range bounds: var must be > lower_excl, < upper_excl, >= lower_incl, <= upper_incl
+    let mut lower_excl: Option<i64> = None; // var > lower_excl
+    let mut upper_excl: Option<i64> = None; // var < upper_excl
+
+    // Scan remaining body for comparisons involving `var`
+    for lit in &body[current_idx + 1..] {
+        let (cmp, negated) = match lit {
+            Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
+            Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
+            _ => continue,
+        };
+        // Identify which side is our variable and which is the "other" term
+        let is_var = |t: &Term| matches!(t, Term::Variable(v) if *v == var);
+        // var OP other  or  other OP var
+        let (effective_op, other_val) = if is_var(&cmp.left) {
+            if let Some(v) = eval_term(&cmp.right, bindings, const_map) {
+                (if negated { negate_comp(cmp.op) } else { cmp.op }, v)
+            } else { continue; }
+        } else if is_var(&cmp.right) {
+            if let Some(v) = eval_term(&cmp.left, bindings, const_map) {
+                // Flip: other OP var  →  var (flip OP) other
+                (if negated { negate_comp(flip_comp(cmp.op)) } else { flip_comp(cmp.op) }, v)
+            } else { continue; }
+        } else { continue; };
+
+        match (&effective_op, &other_val) {
+            (CompOp::Neq, val) => { forbidden.insert(val.clone()); }
+            (CompOp::Gt, Value::Int(n)) => {
+                // var > n: tighten lower bound
+                lower_excl = Some(lower_excl.map_or(*n, |prev| prev.max(*n)));
+            }
+            (CompOp::Geq, Value::Int(n)) => {
+                // var >= n  ≡  var > (n-1)
+                let bound = *n - 1;
+                lower_excl = Some(lower_excl.map_or(bound, |prev| prev.max(bound)));
+            }
+            (CompOp::Lt, Value::Int(n)) => {
+                // var < n: tighten upper bound
+                upper_excl = Some(upper_excl.map_or(*n, |prev| prev.min(*n)));
+            }
+            (CompOp::Leq, Value::Int(n)) => {
+                // var <= n  ≡  var < (n+1)
+                let bound = *n + 1;
+                upper_excl = Some(upper_excl.map_or(bound, |prev| prev.min(bound)));
+            }
+            _ => {}
+        }
+    }
+
+    // Convert range bounds to forbidden values by scanning the domain
+    if lower_excl.is_some() || upper_excl.is_some() {
+        for tuple in domain_values {
+            if tuple.len() == 1
+                && let Value::Int(v) = &tuple[0]
+                    && (lower_excl.is_some_and(|lo| *v <= lo)
+                        || upper_excl.is_some_and(|hi| *v >= hi)) {
+                        forbidden.insert(tuple[0].clone());
+                    }
+        }
+    }
+
+    if forbidden.is_empty() { None } else { Some(forbidden) }
+}
+
+/// Flip comparison direction: `a OP b` → `b (flip OP) a`
+fn flip_comp(op: CompOp) -> CompOp {
+    match op {
+        CompOp::Lt => CompOp::Gt,
+        CompOp::Gt => CompOp::Lt,
+        CompOp::Leq => CompOp::Geq,
+        CompOp::Geq => CompOp::Leq,
+        other => other, // Eq, Neq are symmetric
+    }
+}
+
+/// Negate a comparison: `not (a OP b)` → `a (neg OP) b`
+fn negate_comp(op: CompOp) -> CompOp {
+    match op {
+        CompOp::Eq => CompOp::Neq,
+        CompOp::Neq => CompOp::Eq,
+        CompOp::Lt => CompOp::Geq,
+        CompOp::Geq => CompOp::Lt,
+        CompOp::Gt => CompOp::Leq,
+        CompOp::Leq => CompOp::Gt,
+    }
+}
+
+/// Check if a tuple value is forbidden by the pre-computed set.
+/// Only applies to single-element tuples (arity-1 domain atoms).
+fn is_forbidden(tuple: &[Value], forbidden: &Option<HashSet<Value>>) -> bool {
+    if let Some(set) = forbidden {
+        tuple.len() == 1 && set.contains(&tuple[0])
+    } else {
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enumerate_body(
     body: &[Literal],
@@ -299,15 +408,32 @@ fn enumerate_body(
         Literal::Pos(BodyAtom::Atom(atom)) => {
             let Some(tuples) = pos_domain.get(&atom.predicate) else { return; };
 
+            // Pre-compute forbidden values for single-variable domain atoms
+            // (forward checking for != / > / < constraints)
+            let forbidden = if atom.args.len() == 1 {
+                if let Term::Variable(v) = &atom.args[0] {
+                    if bindings.get(v).is_none() {
+                        collect_forbidden_values(body, idx, *v, bindings, const_map, tuples)
+                    } else { None }
+                } else { None }
+            } else { None };
+            // When forbidden values are active, we can skip the expensive eager
+            // comparison check if the only remaining comparisons are !=/>/</>=/<=
+            // (all handled by forbidden set). Only need eager check for = solving.
+            let skip_eager = forbidden.is_some() && !body[idx + 1..].iter().any(|l| {
+                matches!(l, Literal::Pos(BodyAtom::Comparison(c)) if c.op == CompOp::Eq)
+            });
+
             // Check for derived-key join: use hash index instead of full scan
             if let Some(dj) = derived_joins.get(&idx)
                 && let Some(Value::Int(key)) = eval_term(&dj.bound_key_expr, bindings, const_map) {
                     if let Some(indices) = dj.index.get(&key) {
                         for &ti in indices {
                             let tuple = &tuples[ti];
+                            if is_forbidden(tuple, &forbidden) { continue; }
                             let saved = trail.len();
                             if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
-                                && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
+                                && (skip_eager || check_eager_comparisons(body, idx + 1, bindings, const_map, trail)) {
                                 enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                             }
                             undo_trail(bindings, trail, saved);
@@ -336,9 +462,10 @@ fn enumerate_body(
             if let Some(indices) = best {
                 for &ti in indices {
                     let tuple = &tuples[ti];
+                    if is_forbidden(tuple, &forbidden) { continue; }
                     let saved = trail.len();
                     if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
-                        && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
+                        && (skip_eager || check_eager_comparisons(body, idx + 1, bindings, const_map, trail)) {
                         enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
@@ -346,9 +473,10 @@ fn enumerate_body(
             } else {
                 for tuple in tuples {
                     if tuple.len() != atom.args.len() { continue; }
+                    if is_forbidden(tuple, &forbidden) { continue; }
                     let saved = trail.len();
                     if unify_args_trail(&atom.args, tuple, bindings, const_map, trail)
-                        && check_eager_comparisons(body, idx + 1, bindings, const_map, trail) {
+                        && (skip_eager || check_eager_comparisons(body, idx + 1, bindings, const_map, trail)) {
                         enumerate_body(body, idx + 1, bindings, pos_domain, naf_facts, const_map, trail, arg_idx, derived_joins, callback);
                     }
                     undo_trail(bindings, trail, saved);
@@ -489,8 +617,9 @@ fn try_solve_binop_side(
 }
 
 /// Eagerly evaluate remaining comparisons and solve equalities with one free variable.
+/// Also checks positive atom lookups where all args are ground (early pruning).
 /// Binds solved variables (pushed to trail) so later literals can verify them.
-/// Returns false if any fully-evaluable comparison fails (enabling early pruning).
+/// Returns false if any fully-evaluable comparison or atom lookup fails.
 fn check_eager_comparisons(
     body: &[Literal],
     from_idx: usize,
@@ -498,8 +627,6 @@ fn check_eager_comparisons(
     const_map: &HashMap<SymbolId, Value>,
     trail: &mut Vec<SymbolId>,
 ) -> bool {
-    // Single pass: check/solve comparisons. If a variable is solved, do one
-    // more pass to catch newly-evaluable comparisons.
     let mut solved = false;
     for lit in &body[from_idx..] {
         let (cmp, negated) = match lit {
@@ -507,35 +634,53 @@ fn check_eager_comparisons(
             Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
             _ => continue,
         };
+        // Fast path: skip comparisons with clearly unbound variables
+        // (avoids expensive eval_term on expressions with free vars)
+        if has_unbound_var(&cmp.left, bindings) || has_unbound_var(&cmp.right, bindings) {
+            // But still try to solve equalities with one free variable
+            if !negated && cmp.op == CompOp::Eq
+                && let Some((var, val)) = try_solve_equality(cmp, bindings, const_map) {
+                    trail.push(var);
+                    bindings.insert(var, val);
+                    solved = true;
+                }
+            continue;
+        }
         let lv = eval_term(&cmp.left, bindings, const_map);
         let rv = eval_term(&cmp.right, bindings, const_map);
-        if let (Some(l), Some(r)) = (lv, rv) {
-            if negated == eval_comp(cmp.op, &l, &r) { return false; }
-        } else if !negated && cmp.op == CompOp::Eq
-            && let Some((var, val)) = try_solve_equality(cmp, bindings, const_map) {
-                trail.push(var);
-                bindings.insert(var, val);
-                solved = true;
-        }
+        if let (Some(l), Some(r)) = (lv, rv)
+            && negated == eval_comp(cmp.op, &l, &r) { return false; }
     }
     if !solved { return true; }
-    // Second pass: check comparisons newly evaluable after solving a variable.
-    // The solved equality itself is guaranteed to hold (by construction),
-    // and comparisons already evaluated in pass 1 haven't changed.
-    // Only check comparisons that were NOT evaluable before but are now.
+    // Second pass: recheck comparisons that might now be evaluable after solving
     for lit in &body[from_idx..] {
         let (cmp, negated) = match lit {
             Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
             Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
             _ => continue,
         };
-        // Skip equalities that we might have just solved (guaranteed to hold)
         if !negated && cmp.op == CompOp::Eq { continue; }
+        if has_unbound_var(&cmp.left, bindings) || has_unbound_var(&cmp.right, bindings) { continue; }
         if let (Some(l), Some(r)) = (eval_term(&cmp.left, bindings, const_map), eval_term(&cmp.right, bindings, const_map))
             && negated == eval_comp(cmp.op, &l, &r) { return false; }
     }
     true
 }
+
+/// Quick check if a term contains a variable not yet bound. Avoids full eval_term.
+fn has_unbound_var(term: &Term, bindings: &Bindings) -> bool {
+    match term {
+        Term::Variable(v) => bindings.get(v).is_none(),
+        Term::BinOp(_, l, r) => has_unbound_var(l, bindings) || has_unbound_var(r, bindings),
+        Term::UnaryMinus(t) | Term::Abs(t) => has_unbound_var(t, bindings),
+        Term::Function(_, args) => args.iter().any(|a| has_unbound_var(a, bindings)),
+        Term::Integer(_) | Term::Symbolic(_) | Term::StringConst(_) | Term::Anonymous => false,
+        Term::Range(a, b) => has_unbound_var(a, bindings) || has_unbound_var(b, bindings),
+        Term::Pool(ts) => ts.iter().any(|t| has_unbound_var(t, bindings)),
+    }
+}
+
+
 
 fn undo_trail(bindings: &mut Bindings, trail: &mut Vec<SymbolId>, saved: usize) {
     while trail.len() > saved {
@@ -762,8 +907,6 @@ fn collect_term_vars(t: &Term, vars: &mut Vec<SymbolId>) {
 /// where the two positive atoms share the same predicate and the equality connects
 /// variables from the first atom to the second. Builds a hash index on the derived key.
 fn detect_derived_joins(body: &[Literal], domain: &FactStore) -> DerivedJoinMap {
-    use std::collections::HashSet;
-
     let mut result = DerivedJoinMap::new();
 
     // Find all positive atom positions with their predicates and variable sets
