@@ -62,7 +62,11 @@ impl<'a> Lexer<'a> {
             b']' => { self.advance_byte(); Ok(Token::RBrack) }
             b'+' => { self.advance_byte(); Ok(Token::Plus) }
             b'-' => { self.advance_byte(); Ok(Token::Minus) }
-            b'*' => { self.advance_byte(); Ok(Token::Star) }
+            b'*' => {
+                self.advance_byte();
+                if self.peek() == Some(b'*') { self.advance_byte(); Ok(Token::Power) }
+                else { Ok(Token::Star) }
+            }
             b'/' => { self.advance_byte(); Ok(Token::Slash) }
             b'\\' => { self.advance_byte(); Ok(Token::Backslash) }
             b'=' => {

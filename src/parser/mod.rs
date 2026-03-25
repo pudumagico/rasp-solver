@@ -866,6 +866,7 @@ impl<'a> Parser<'a> {
         loop {
             let op = match &self.current {
                 Token::Star => BinOp::Mul,
+                Token::Power => BinOp::Pow,
                 Token::Slash => BinOp::Div,
                 Token::Backslash => BinOp::Mod,
                 _ => break,

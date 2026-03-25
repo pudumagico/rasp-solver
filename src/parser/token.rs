@@ -54,6 +54,7 @@ pub enum Token {
     Maximize,
     At,    // @
     Tilde, // ~
+    Power, // **
 
     // Special
     Eof,

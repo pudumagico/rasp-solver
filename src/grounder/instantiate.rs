@@ -704,6 +704,7 @@ pub fn eval_term(term: &Term, bindings: &Bindings, const_map: &HashMap<SymbolId,
                 BinOp::Mul => lv.checked_mul(rv)?,
                 BinOp::Div => { if rv == 0 { return None; } lv.checked_div(rv)? }
                 BinOp::Mod => { if rv == 0 { return None; } lv.checked_rem(rv)? }
+                BinOp::Pow => { if rv < 0 { return None; } lv.checked_pow(rv as u32)? }
             };
             Some(Value::Int(result))
         }
