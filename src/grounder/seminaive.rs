@@ -207,6 +207,7 @@ fn evaluate_stratum(
             if let RuleHead::Choice(heads) = &gr.head {
                 let bound_constraints = generate_bound_constraints(
                     heads, &ch.lower, &ch.upper, &gr.body_pos, &gr.body_neg, const_map,
+                    interner, atom_table,
                 );
                 all_rules.extend(bound_constraints);
             }
@@ -439,9 +440,11 @@ fn collect_vars(t: &Term, vars: &mut HashSet<SymbolId>) {
     }
 }
 
-/// Generate constraint rules to enforce choice rule bounds.
+/// Generate constraint rules to enforce choice rule bounds using staircase encoding.
 /// Lower bound L: at least L head atoms must be true (when body holds).
 /// Upper bound U: at most U head atoms can be true (when body holds).
+/// Uses O(n*k) auxiliary rules instead of exponential C(n,k) subset constraints.
+#[allow(clippy::too_many_arguments)]
 fn generate_bound_constraints(
     heads: &[AtomId],
     lower: &Option<Term>,
@@ -449,6 +452,8 @@ fn generate_bound_constraints(
     body_pos: &[AtomId],
     body_neg: &[AtomId],
     const_map: &HashMap<SymbolId, Value>,
+    interner: &mut Interner,
+    atom_table: &mut AtomTable,
 ) -> Vec<GroundRule> {
     let mut rules = Vec::new();
     let n = heads.len();
@@ -461,64 +466,102 @@ fn generate_bound_constraints(
         }
     };
 
-    // Upper bound: at most U can be true → every (U+1)-subset must have a false atom
-    // Constraint: `:- body, h1, h2, ..., h_{U+1}` for each (U+1)-subset
+    // Upper bound: at most U can be true → "at least U+1 are true" must be false
     if let Some(u_term) = upper
         && let Some(u) = eval_bound(u_term)
-            && u < n {
-                let subset_size = u + 1;
-                for_each_subset(heads, subset_size, &mut |subset| {
-                    let mut bp = body_pos.to_vec();
-                    bp.extend_from_slice(subset);
-                    rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
-                });
-            }
+        && u < n
+        && let Some((aux_rules, result_id)) = build_staircase(heads, u + 1, interner, atom_table)
+    {
+        rules.extend(aux_rules);
+        // :- body, result (too many are true → violation)
+        let mut bp = body_pos.to_vec();
+        bp.push(result_id);
+        rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
+    }
 
-    // Lower bound: at least L must be true → constraint fires if fewer than L are true
-    // Constraint: `:- body, not h1, not h2, ..., not h_{n-L+1}` for each (n-L+1)-subset
-    // i.e., if n-L+1 atoms are false, the bound is violated
+    // Lower bound: at least L must be true → "at least L are true" must hold
     if let Some(l_term) = lower
         && let Some(l) = eval_bound(l_term)
-            && l > 0 {
-                if l > n {
-                    // Impossible: need more atoms than exist → always UNSAT when body holds
-                    rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: body_neg.to_vec() });
-                } else {
-                    let false_count = n - l + 1;
-                    for_each_subset(heads, false_count, &mut |subset| {
-                        let mut bn = body_neg.to_vec();
-                        bn.extend_from_slice(subset);
-                        rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
-                    });
-                }
-            }
+        && l > 0
+    {
+        if l > n {
+            // Impossible: need more atoms than exist → always UNSAT when body holds
+            rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: body_neg.to_vec() });
+        } else if let Some((aux_rules, result_id)) = build_staircase(heads, l, interner, atom_table) {
+            rules.extend(aux_rules);
+            // :- body, not result (too few are true → violation)
+            let mut bn = body_neg.to_vec();
+            bn.push(result_id);
+            rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
+        }
+    }
 
     rules
 }
 
-/// Call `callback` with every k-element subset of `elems`.
-fn for_each_subset(elems: &[AtomId], k: usize, callback: &mut impl FnMut(&[AtomId])) {
-    if k == 0 {
-        callback(&[]);
-        return;
+/// Build staircase encoding: aux[i][j] = "at least j of the first i elements are true".
+/// Returns auxiliary rules and the AtomId for aux[n][target] ("at least target are true").
+fn build_staircase(
+    elements: &[AtomId],
+    target: usize,
+    interner: &mut Interner,
+    atom_table: &mut AtomTable,
+) -> Option<(Vec<GroundRule>, AtomId)> {
+    let n = elements.len();
+    if target > n { return None; }
+    if target == 0 {
+        let name = interner.intern("__card_true");
+        let id = atom_table.get_or_insert(GroundAtom { predicate: name, args: vec![] });
+        return Some((vec![GroundRule { head: RuleHead::Normal(id), body_pos: vec![], body_neg: vec![] }], id));
     }
-    if k > elems.len() { return; }
-    let mut indices: Vec<usize> = (0..k).collect();
-    loop {
-        let subset: Vec<AtomId> = indices.iter().map(|&i| elems[i]).collect();
-        callback(&subset);
-        // Advance to next combination
-        let mut i = k;
-        loop {
-            if i == 0 { return; }
-            i -= 1;
-            indices[i] += 1;
-            if indices[i] <= elems.len() - k + i { break; }
-        }
-        for j in (i + 1)..k {
-            indices[j] = indices[j - 1] + 1;
+
+    let mut rules = Vec::new();
+    let agg_id = atom_table.len();
+    let mut aux = vec![vec![AtomId(0); target + 1]; n + 1];
+
+    for (i, row) in aux.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            let name = interner.intern(&format!("__card_{agg_id}_{i}_{j}"));
+            *cell = atom_table.get_or_insert(GroundAtom { predicate: name, args: vec![] });
         }
     }
+
+    // Base: aux[i][0] always true
+    for row in &aux {
+        rules.push(GroundRule { head: RuleHead::Normal(row[0]), body_pos: vec![], body_neg: vec![] });
+    }
+
+    // Staircase: forward support + reverse completion constraints
+    for i in 1..=n {
+        for j in 1..=target.min(i) {
+            // Skip: aux[i][j] :- aux[i-1][j]
+            rules.push(GroundRule {
+                head: RuleHead::Normal(aux[i][j]),
+                body_pos: vec![aux[i - 1][j]],
+                body_neg: vec![],
+            });
+            // Include: aux[i][j] :- elem[i-1], aux[i-1][j-1]
+            rules.push(GroundRule {
+                head: RuleHead::Normal(aux[i][j]),
+                body_pos: vec![elements[i - 1], aux[i - 1][j - 1]],
+                body_neg: vec![],
+            });
+            // Completion: :- aux[i][j], not aux[i-1][j], not elem[i-1]
+            rules.push(GroundRule {
+                head: RuleHead::Constraint,
+                body_pos: vec![aux[i][j]],
+                body_neg: vec![aux[i - 1][j], elements[i - 1]],
+            });
+            // Completion: :- aux[i][j], not aux[i-1][j], not aux[i-1][j-1]
+            rules.push(GroundRule {
+                head: RuleHead::Constraint,
+                body_pos: vec![aux[i][j]],
+                body_neg: vec![aux[i - 1][j], aux[i - 1][j - 1]],
+            });
+        }
+    }
+
+    Some((rules, aux[n][target]))
 }
 
 /// Deduplicate ground rules.
