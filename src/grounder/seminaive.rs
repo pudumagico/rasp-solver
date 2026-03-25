@@ -68,7 +68,39 @@ pub fn evaluate(
             }
     }
 
-    for stratum in strata {
+    // Magic set optimization: for constraints `:- not p(Vs), q(Vs).` where p is
+    // defined by a rule and q has ground facts, restrict p's grounding to demanded
+    // tuples by rewriting p's rule to include a demand guard atom.
+    let magic_program = apply_magic_sets_global(program, &facts, interner);
+    let program = magic_program.as_ref().unwrap_or(program);
+    // If magic sets created demand facts, add them
+    for stmt in &program.statements {
+        if let Statement::Rule(r) = stmt
+            && r.body.is_empty() && r.head.len() == 1 {
+                let h = &r.head[0];
+                let name = interner.resolve(h.predicate);
+                if name.starts_with("__magic_") {
+                    let args: Option<Vec<Value>> = h.args.iter()
+                        .map(|t| instantiate::eval_term(t, &instantiate::Bindings::new(), const_map))
+                        .collect();
+                    if let Some(args) = args {
+                        add_to_both(h.predicate, args.clone(), &mut facts, &mut known);
+                        let ga = GroundAtom { predicate: h.predicate, args };
+                        let id = atom_table.get_or_insert(ga);
+                        all_rules.push(GroundRule { head: RuleHead::Normal(id), body_pos: vec![], body_neg: vec![] });
+                    }
+                }
+            }
+    }
+
+    // Re-stratify if program was modified
+    let strata = if magic_program.is_some() {
+        super::scc::stratify(program).unwrap_or_else(|_| strata.to_vec())
+    } else {
+        strata.to_vec()
+    };
+
+    for stratum in &strata {
         evaluate_stratum(
             stratum, program, &mut facts, &mut known, &mut atom_table,
             &mut all_rules, interner, const_map,
@@ -301,6 +333,108 @@ fn evaluate_stratum(
         let ground_rules = instantiate::instantiate_constraint_with_index(&c.body, facts, &domain, atom_table, const_map, agg_ctx, &domain_idx);
         all_rules.extend(ground_rules);
     }
+}
+
+
+/// Magic set rewriting at the AST level. Detects constraints of the form
+/// `:- not p(V1,...,Vn), q(V1,...,Vn).` where p is defined by a rule and q
+/// has ground facts. Adds `__magic_p(V1,...,Vn)` to p's rule body and creates
+/// demand facts `__magic_p(t1,...,tn).` for each ground q tuple.
+fn apply_magic_sets_global(
+    program: &ast::Program,
+    facts: &FactStore,
+    interner: &mut Interner,
+) -> Option<ast::Program> {
+    // 1. Find rule-defined predicates
+    let mut rule_defined: HashSet<SymbolId> = HashSet::new();
+    for stmt in &program.statements {
+        if let Statement::Rule(r) = stmt
+            && !r.body.is_empty() {
+                for head in &r.head {
+                    rule_defined.insert(head.predicate);
+                }
+            }
+    }
+
+    // 2. Scan constraints for demand patterns
+    let mut demands: HashMap<SymbolId, (SymbolId, SymbolId)> = HashMap::new(); // target_pred -> (magic_pred, source_pred)
+    for stmt in &program.statements {
+        let body = match stmt {
+            Statement::Constraint(c) => &c.body,
+            _ => continue,
+        };
+        let mut neg_atoms: Vec<&ast::Atom> = Vec::new();
+        let mut pos_atoms: Vec<&ast::Atom> = Vec::new();
+        for lit in body {
+            match lit {
+                ast::Literal::Neg(ast::BodyAtom::Atom(a)) => neg_atoms.push(a),
+                ast::Literal::Pos(ast::BodyAtom::Atom(a)) => pos_atoms.push(a),
+                _ => {}
+            }
+        }
+        for neg in &neg_atoms {
+            if !rule_defined.contains(&neg.predicate) { continue; }
+            for pos in &pos_atoms {
+                if neg.args.len() != pos.args.len() { continue; }
+                if facts.get(&pos.predicate).is_none_or(|t| t.is_empty()) { continue; }
+                // Check: same variables in same positions
+                let vars_match = neg.args.iter().zip(pos.args.iter()).all(|(n, p)| {
+                    matches!((n, p), (Term::Variable(a), Term::Variable(b)) if a == b)
+                });
+                if !vars_match { continue; }
+
+                let neg_name = interner.resolve(neg.predicate).to_string();
+                let magic_pred = interner.intern(&format!("__magic_{neg_name}"));
+                demands.insert(neg.predicate, (magic_pred, pos.predicate));
+                break;
+            }
+        }
+    }
+
+    if demands.is_empty() { return None; }
+
+    // 3. Rewrite the program: add demand guards + demand facts
+    let mut new_stmts = Vec::new();
+    for stmt in &program.statements {
+        match stmt {
+            Statement::Rule(r) if !r.body.is_empty() => {
+                if r.head.len() == 1
+                    && let Some(&(magic_pred, source_pred)) = demands.get(&r.head[0].predicate) {
+                        // Add demand guard to the body
+                        let magic_atom = ast::Atom {
+                            predicate: magic_pred,
+                            args: r.head[0].args.clone(),
+                        };
+                        let mut new_body = vec![ast::Literal::Pos(ast::BodyAtom::Atom(magic_atom))];
+                        new_body.extend(r.body.clone());
+                        new_stmts.push(Statement::Rule(ast::Rule {
+                            head: r.head.clone(),
+                            body: new_body,
+                        }));
+
+                        // Create demand facts from the source predicate
+                        if let Some(tuples) = facts.get(&source_pred) {
+                            for tuple in tuples {
+                                let args: Vec<Term> = tuple.iter().map(|v| match v {
+                                    Value::Int(n) => Term::Integer(*n),
+                                    Value::Sym(s) => Term::Symbolic(*s),
+                                }).collect();
+                                let fact_atom = ast::Atom { predicate: magic_pred, args };
+                                new_stmts.push(Statement::Rule(ast::Rule {
+                                    head: vec![fact_atom],
+                                    body: vec![],
+                                }));
+                            }
+                        }
+                        continue;
+                    }
+                new_stmts.push(stmt.clone());
+            }
+            _ => new_stmts.push(stmt.clone()),
+        }
+    }
+
+    Some(ast::Program { statements: new_stmts })
 }
 
 /// Detect symmetric 2-arg choice predicates and add lex-leader ordering constraints.

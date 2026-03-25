@@ -4,6 +4,7 @@ use crate::parser::ast::{self, BodyAtom, Literal, Statement};
 use crate::types::SymbolId;
 
 /// One stratum: a set of predicates to evaluate together, and the rule indices.
+#[derive(Clone)]
 pub struct Stratum {
     pub predicates: HashSet<SymbolId>,
     pub rule_indices: Vec<usize>,
