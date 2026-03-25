@@ -127,12 +127,35 @@ fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Lite
         .chain(single_atoms)
         .collect();
 
-    // Interleave comparisons after each atom that completes their variables
+    // Interleave comparisons with atoms. Two strategies:
+    // 1. After each atom: place comparisons whose variables are all now bound
+    // 2. Before an atom: if a comparison has exactly ONE free variable that
+    //    the atom would bind, and the comparison is an equality that can solve
+    //    for that variable, place the comparison BEFORE the atom (so the atom
+    //    becomes a check instead of an enumeration)
     let mut bound_vars: HashSet<SymbolId> = HashSet::new();
     let mut result = Vec::with_capacity(ordered_atoms.len() + comps.len() + others.len());
     let mut placed = vec![false; comps.len()];
 
     for atom_lit in &ordered_atoms {
+        // Strategy 2: before this atom, place equality comparisons that can solve
+        // for the atom's variable (reducing enumeration to a point lookup)
+        for (ci, comp) in comps.iter().enumerate() {
+            if placed[ci] { continue; }
+            let comp_vars = lit_vars(comp);
+            let free: HashSet<_> = comp_vars.difference(&bound_vars).copied().collect();
+            if free.len() == 1 {
+                // This comparison has exactly 1 free variable
+                if let ast::Literal::Pos(ast::BodyAtom::Comparison(c)) = comp
+                    && c.op == ast::CompOp::Eq {
+                        // It's an equality with 1 free var → can solve, place before atom
+                        result.push(comp.clone());
+                        placed[ci] = true;
+                        bound_vars.extend(free);
+                    }
+            }
+        }
+
         if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = atom_lit {
             for arg in &a.args { collect_vars(arg, &mut bound_vars); }
         }

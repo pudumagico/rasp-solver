@@ -348,11 +348,19 @@ impl<'a> Parser<'a> {
             }
         }
         let mut condition = Vec::new();
-        // Accept multiple `:` separated condition groups (old gringo)
+        // Accept multiple `:` separated condition groups (old gringo).
+        // In old gringo, `=` separates conditions from weight, so parse atoms
+        // only (not comparisons) in condition position.
         while self.current == Token::Colon {
             self.advance()?;
             if self.current == Token::Eq { break; }
-            condition.extend(self.parse_condition_list()?);
+            let atom = self.parse_atom()?;
+            condition.push(Literal::Pos(BodyAtom::Atom(atom)));
+            while self.current == Token::Comma {
+                self.advance()?;
+                let atom = self.parse_atom()?;
+                condition.push(Literal::Pos(BodyAtom::Atom(atom)));
+            }
         }
         // Old gringo: `lit : lit2 = W[@P]` — the "weight" we parsed is actually the first
         // condition literal, and the real weight comes after `=`
