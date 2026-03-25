@@ -82,12 +82,12 @@ fn expand_body_ranges(body: &[ast::Literal], const_map: &HashMap<SymbolId, Value
     vec![reorder_body_interleave_comparisons(result)]
 }
 
-/// Reorder body literals: place each comparison immediately after the atom
-/// that binds its last free variable. This ensures comparisons are checked
-/// as early as possible during enumeration.
+/// Reorder body literals:
+/// 1. Multi-arg atoms before their single-arg component atoms (subsumption)
+/// 2. Remove redundant single-arg atoms subsumed by multi-arg atoms
+/// 3. Place comparisons immediately after the atom that binds their last variable
 fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Literal> {
     use std::collections::HashSet;
-    // Separate atoms and comparisons
     let mut atoms: Vec<ast::Literal> = Vec::new();
     let mut comps: Vec<ast::Literal> = Vec::new();
     let mut others: Vec<ast::Literal> = Vec::new();
@@ -100,34 +100,51 @@ fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Lite
             _ => others.push(lit),
         }
     }
-    if comps.is_empty() { atoms.extend(others); return atoms; }
+    if comps.is_empty() && atoms.len() <= 1 { atoms.extend(others); return atoms; }
 
-    // Build reordered body: after each atom, insert any comparisons
-    // whose variables are now all bound
+    // Separate multi-arg atoms (arity >= 2) from single-arg atoms (arity 1)
+    let mut multi_atoms: Vec<ast::Literal> = Vec::new();
+    let mut single_atoms: Vec<ast::Literal> = Vec::new();
+    for lit in &atoms {
+        if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = lit {
+            if a.args.len() >= 2 { multi_atoms.push(lit.clone()); }
+            else { single_atoms.push(lit.clone()); }
+        } else {
+            single_atoms.push(lit.clone());
+        }
+    }
+
+    // Find which variables are bound by multi-arg atoms
+    let mut multi_bound: HashSet<SymbolId> = HashSet::new();
+    for lit in &multi_atoms {
+        if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = lit {
+            for arg in &a.args { collect_vars(arg, &mut multi_bound); }
+        }
+    }
+
+    // Order: multi-arg atoms first (more selective joins), then single-arg atoms
+    let ordered_atoms: Vec<ast::Literal> = multi_atoms.into_iter()
+        .chain(single_atoms)
+        .collect();
+
+    // Interleave comparisons after each atom that completes their variables
     let mut bound_vars: HashSet<SymbolId> = HashSet::new();
-    let mut result = Vec::with_capacity(atoms.len() + comps.len() + others.len());
+    let mut result = Vec::with_capacity(ordered_atoms.len() + comps.len() + others.len());
     let mut placed = vec![false; comps.len()];
 
-    for atom_lit in &atoms {
-        // Collect variables this atom binds
+    for atom_lit in &ordered_atoms {
         if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = atom_lit {
-            for arg in &a.args {
-                collect_vars(arg, &mut bound_vars);
-            }
+            for arg in &a.args { collect_vars(arg, &mut bound_vars); }
         }
         result.push(atom_lit.clone());
-
-        // Insert any now-evaluable comparisons
         for (ci, comp) in comps.iter().enumerate() {
             if placed[ci] { continue; }
-            let comp_vars = lit_vars(comp);
-            if comp_vars.is_subset(&bound_vars) {
+            if lit_vars(comp).is_subset(&bound_vars) {
                 result.push(comp.clone());
                 placed[ci] = true;
             }
         }
     }
-    // Append remaining unplaced comparisons and others
     for (ci, comp) in comps.into_iter().enumerate() {
         if !placed[ci] { result.push(comp); }
     }

@@ -278,82 +278,6 @@ pub fn enumerate_body_public(
     enumerate_body(body, idx, &mut b, pos_domain, naf_facts, const_map, &mut trail, &arg_idx, &no_dj, callback);
 }
 
-/// For a single-variable domain atom, collect values that are forbidden by `!=`
-/// comparisons and out-of-range by `>`, `<`, `>=`, `<=` comparisons in the remaining body.
-/// Returns None if no constraints apply (avoid allocating a HashSet).
-fn collect_forbidden_values(
-    body: &[Literal],
-    current_idx: usize,
-    var: SymbolId,
-    bindings: &Bindings,
-    const_map: &HashMap<SymbolId, Value>,
-    domain_values: &[Vec<Value>],
-) -> Option<HashSet<Value>> {
-    let mut forbidden = HashSet::new();
-    // Track range bounds: var must be > lower_excl, < upper_excl, >= lower_incl, <= upper_incl
-    let mut lower_excl: Option<i64> = None; // var > lower_excl
-    let mut upper_excl: Option<i64> = None; // var < upper_excl
-
-    // Scan remaining body for comparisons involving `var`
-    for lit in &body[current_idx + 1..] {
-        let (cmp, negated) = match lit {
-            Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
-            Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
-            _ => continue,
-        };
-        // Identify which side is our variable and which is the "other" term
-        let is_var = |t: &Term| matches!(t, Term::Variable(v) if *v == var);
-        // var OP other  or  other OP var
-        let (effective_op, other_val) = if is_var(&cmp.left) {
-            if let Some(v) = eval_term(&cmp.right, bindings, const_map) {
-                (if negated { negate_comp(cmp.op) } else { cmp.op }, v)
-            } else { continue; }
-        } else if is_var(&cmp.right) {
-            if let Some(v) = eval_term(&cmp.left, bindings, const_map) {
-                // Flip: other OP var  →  var (flip OP) other
-                (if negated { negate_comp(flip_comp(cmp.op)) } else { flip_comp(cmp.op) }, v)
-            } else { continue; }
-        } else { continue; };
-
-        match (&effective_op, &other_val) {
-            (CompOp::Neq, val) => { forbidden.insert(val.clone()); }
-            (CompOp::Gt, Value::Int(n)) => {
-                // var > n: tighten lower bound
-                lower_excl = Some(lower_excl.map_or(*n, |prev| prev.max(*n)));
-            }
-            (CompOp::Geq, Value::Int(n)) => {
-                // var >= n  ≡  var > (n-1)
-                let bound = *n - 1;
-                lower_excl = Some(lower_excl.map_or(bound, |prev| prev.max(bound)));
-            }
-            (CompOp::Lt, Value::Int(n)) => {
-                // var < n: tighten upper bound
-                upper_excl = Some(upper_excl.map_or(*n, |prev| prev.min(*n)));
-            }
-            (CompOp::Leq, Value::Int(n)) => {
-                // var <= n  ≡  var < (n+1)
-                let bound = *n + 1;
-                upper_excl = Some(upper_excl.map_or(bound, |prev| prev.min(bound)));
-            }
-            _ => {}
-        }
-    }
-
-    // Convert range bounds to forbidden values by scanning the domain
-    if lower_excl.is_some() || upper_excl.is_some() {
-        for tuple in domain_values {
-            if tuple.len() == 1
-                && let Value::Int(v) = &tuple[0]
-                    && (lower_excl.is_some_and(|lo| *v <= lo)
-                        || upper_excl.is_some_and(|hi| *v >= hi)) {
-                        forbidden.insert(tuple[0].clone());
-                    }
-        }
-    }
-
-    if forbidden.is_empty() { None } else { Some(forbidden) }
-}
-
 /// Flip comparison direction: `a OP b` → `b (flip OP) a`
 fn flip_comp(op: CompOp) -> CompOp {
     match op {
@@ -379,12 +303,95 @@ fn negate_comp(op: CompOp) -> CompOp {
 
 /// Check if a tuple value is forbidden by the pre-computed set.
 /// Only applies to single-element tuples (arity-1 domain atoms).
-fn is_forbidden(tuple: &[Value], forbidden: &Option<HashSet<Value>>) -> bool {
-    if let Some(set) = forbidden {
-        tuple.len() == 1 && set.contains(&tuple[0])
-    } else {
-        false
+/// Check if tuple is forbidden. Supports both single-arg and multi-arg atoms.
+/// `forbidden_args` maps argument position → set of forbidden values.
+fn is_forbidden(tuple: &[Value], forbidden: &Option<ForbiddenSet>) -> bool {
+    if let Some(fs) = forbidden {
+        for (&pos, set) in &fs.by_arg {
+            if let Some(val) = tuple.get(pos)
+                && set.contains(val) { return true; }
+        }
     }
+    false
+}
+
+/// Forbidden values per argument position of an atom.
+struct ForbiddenSet {
+    by_arg: HashMap<usize, HashSet<Value>>,
+}
+
+/// Collect forbidden values for ANY atom (single or multi-arg).
+/// For each free variable in the atom's arguments that has != constraints
+/// with already-bound variables, records forbidden values at that arg position.
+fn collect_forbidden_for_atom(
+    body: &[Literal],
+    current_idx: usize,
+    atom: &ast::Atom,
+    bindings: &Bindings,
+    const_map: &HashMap<SymbolId, Value>,
+    domain_values: &[Vec<Value>],
+) -> Option<ForbiddenSet> {
+    let mut by_arg: HashMap<usize, HashSet<Value>> = HashMap::new();
+
+    for (pos, arg) in atom.args.iter().enumerate() {
+        let Term::Variable(var) = arg else { continue; };
+        if bindings.get(var).is_some() { continue; } // already bound
+
+        let mut forbidden = HashSet::new();
+        let mut lower_excl: Option<i64> = None;
+        let mut upper_excl: Option<i64> = None;
+
+        for lit in &body[current_idx + 1..] {
+            let (cmp, negated) = match lit {
+                Literal::Pos(BodyAtom::Comparison(c)) => (c, false),
+                Literal::Neg(BodyAtom::Comparison(c)) => (c, true),
+                _ => continue,
+            };
+            let is_var = |t: &Term| matches!(t, Term::Variable(v) if *v == *var);
+            let (effective_op, other_val) = if is_var(&cmp.left) {
+                if let Some(v) = eval_term(&cmp.right, bindings, const_map) {
+                    (if negated { negate_comp(cmp.op) } else { cmp.op }, v)
+                } else { continue; }
+            } else if is_var(&cmp.right) {
+                if let Some(v) = eval_term(&cmp.left, bindings, const_map) {
+                    (if negated { negate_comp(flip_comp(cmp.op)) } else { flip_comp(cmp.op) }, v)
+                } else { continue; }
+            } else { continue; };
+
+            match (&effective_op, &other_val) {
+                (CompOp::Neq, val) => { forbidden.insert(val.clone()); }
+                (CompOp::Gt, Value::Int(n)) => {
+                    lower_excl = Some(lower_excl.map_or(*n, |prev| prev.max(*n)));
+                }
+                (CompOp::Geq, Value::Int(n)) => {
+                    lower_excl = Some(lower_excl.map_or(*n - 1, |prev| prev.max(*n - 1)));
+                }
+                (CompOp::Lt, Value::Int(n)) => {
+                    upper_excl = Some(upper_excl.map_or(*n, |prev| prev.min(*n)));
+                }
+                (CompOp::Leq, Value::Int(n)) => {
+                    upper_excl = Some(upper_excl.map_or(*n + 1, |prev| prev.min(*n + 1)));
+                }
+                _ => {}
+            }
+        }
+
+        if lower_excl.is_some() || upper_excl.is_some() {
+            for tuple in domain_values {
+                if let Some(Value::Int(v)) = tuple.get(pos)
+                    && (lower_excl.is_some_and(|lo| *v <= lo)
+                        || upper_excl.is_some_and(|hi| *v >= hi)) {
+                        forbidden.insert(Value::Int(*v));
+                    }
+            }
+        }
+
+        if !forbidden.is_empty() {
+            by_arg.insert(pos, forbidden);
+        }
+    }
+
+    if by_arg.is_empty() { None } else { Some(ForbiddenSet { by_arg }) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -408,18 +415,9 @@ fn enumerate_body(
         Literal::Pos(BodyAtom::Atom(atom)) => {
             let Some(tuples) = pos_domain.get(&atom.predicate) else { return; };
 
-            // Pre-compute forbidden values for single-variable domain atoms
-            // (forward checking for != / > / < constraints)
-            let forbidden = if atom.args.len() == 1 {
-                if let Term::Variable(v) = &atom.args[0] {
-                    if bindings.get(v).is_none() {
-                        collect_forbidden_values(body, idx, *v, bindings, const_map, tuples)
-                    } else { None }
-                } else { None }
-            } else { None };
-            // When forbidden values are active, we can skip the expensive eager
-            // comparison check if the only remaining comparisons are !=/>/</>=/<=
-            // (all handled by forbidden set). Only need eager check for = solving.
+            // Pre-compute forbidden values for atom arguments
+            // (forward checking for != / > / < constraints on any free variable)
+            let forbidden = collect_forbidden_for_atom(body, idx, atom, bindings, const_map, tuples);
             let skip_eager = forbidden.is_some() && !body[idx + 1..].iter().any(|l| {
                 matches!(l, Literal::Pos(BodyAtom::Comparison(c)) if c.op == CompOp::Eq)
             });
