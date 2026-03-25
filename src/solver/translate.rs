@@ -123,7 +123,6 @@ pub fn translate(program: &GroundProgram) -> Translation {
         let atom = AtomId(i);
         if choice_atoms[atom.index()] { continue; }
         if !support.contains_key(&atom) {
-            // Atom has no support — must be false
             clauses.push(vec![Lit::neg(atom)]);
         }
     }

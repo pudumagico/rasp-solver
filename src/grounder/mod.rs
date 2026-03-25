@@ -122,10 +122,9 @@ fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Lite
         }
     }
 
-    // Order: multi-arg atoms first (more selective joins), then single-arg atoms
-    let ordered_atoms: Vec<ast::Literal> = multi_atoms.into_iter()
-        .chain(single_atoms)
-        .collect();
+    // Keep original atom order (multi-arg-first reordering disabled — interacts
+    // badly with alldifferent injection for some programs)
+    let ordered_atoms: Vec<ast::Literal> = atoms;
 
     // Interleave comparisons with atoms. Two strategies:
     // 1. After each atom: place comparisons whose variables are all now bound
@@ -138,23 +137,8 @@ fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Lite
     let mut placed = vec![false; comps.len()];
 
     for atom_lit in &ordered_atoms {
-        // Strategy 2: before this atom, place equality comparisons that can solve
-        // for the atom's variable (reducing enumeration to a point lookup)
-        for (ci, comp) in comps.iter().enumerate() {
-            if placed[ci] { continue; }
-            let comp_vars = lit_vars(comp);
-            let free: HashSet<_> = comp_vars.difference(&bound_vars).copied().collect();
-            if free.len() == 1 {
-                // This comparison has exactly 1 free variable
-                if let ast::Literal::Pos(ast::BodyAtom::Comparison(c)) = comp
-                    && c.op == ast::CompOp::Eq {
-                        // It's an equality with 1 free var → can solve, place before atom
-                        result.push(comp.clone());
-                        placed[ci] = true;
-                        bound_vars.extend(free);
-                    }
-            }
-        }
+        // Strategy 2 disabled: equality-before-atom reordering interacts badly
+        // with alldifferent injection, causing incorrect UNSAT on some programs.
 
         if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = atom_lit {
             for arg in &a.args { collect_vars(arg, &mut bound_vars); }

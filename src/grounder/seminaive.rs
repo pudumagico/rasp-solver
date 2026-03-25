@@ -68,10 +68,16 @@ pub fn evaluate(
             }
     }
 
+    // Alldifferent injection disabled — causes incorrect UNSAT when combined
+    // with multiple overlapping cardinality constraints. The interaction between
+    // injected != comparisons and the staircase/subset encoding creates
+    // unsatisfiable ground programs for satisfiable inputs.
+
     // Magic set optimization: for constraints `:- not p(Vs), q(Vs).` where p is
     // defined by a rule and q has ground facts, restrict p's grounding to demanded
     // tuples by rewriting p's rule to include a demand guard atom.
-    let magic_program = apply_magic_sets_global(program, &facts, interner);
+    let magic_program: Option<ast::Program> = None; // TODO: magic sets disabled pending fix
+    let _ = apply_magic_sets_global; // suppress unused warning
     let program = magic_program.as_ref().unwrap_or(program);
     // If magic sets created demand facts, add them
     for stmt in &program.statements {
@@ -335,6 +341,131 @@ fn evaluate_stratum(
     }
 }
 
+
+/// Detect implicit alldifferent constraints from cardinality choice rules and
+/// inject != comparisons into rule bodies. For `1{x(L,V):values(V)}1 :- letter(L).`
+/// combined with `{x(L,V):letter(L)} 1 :- values(V).`, the V values are alldifferent
+/// across different L values. Rules with multiple `x(l1,V1), x(l2,V2)` atoms get
+/// `V1 != V2` injected (if not already present).
+#[allow(dead_code)]
+fn inject_alldifferent(program: &ast::Program, interner: &mut Interner) -> Option<ast::Program> {
+    // Step 1: Find 2-arg choice predicates with "exactly one" + "at most one" patterns
+    // Pattern A: `1 { pred(L,V) : domain(V) } 1 :- type(L).` → one V per L
+    // Pattern B: `{ pred(L,V) : type(L) } 1 :- domain(V).` → at most one L per V
+    // Combined: pred's second arg is alldifferent across first-arg values
+    let mut alldiff_preds: HashSet<SymbolId> = HashSet::new();
+    let mut pred_candidates: HashMap<SymbolId, (bool, bool)> = HashMap::new(); // (has_one_per_first, has_atmost_one_per_second)
+
+    for stmt in &program.statements {
+        if let Statement::Choice(ch) = stmt {
+            if ch.elements.len() != 1 { continue; }
+            let elem = &ch.elements[0];
+            if elem.atom.args.len() != 2 { continue; }
+            let pred = elem.atom.predicate;
+
+            // Check if lower=1, upper=1 (exactly one) with condition on arg[1] and body on arg[0]
+            let is_exact_one = matches!((&ch.lower, &ch.upper),
+                (Some(Term::Integer(1)), Some(Term::Integer(1))));
+            let has_upper_one = matches!(&ch.upper, Some(Term::Integer(1)));
+
+            // Pattern A: condition references domain of arg[1], body references type of arg[0]
+            // The condition has a predicate with a variable matching the choice's arg[1]
+            if is_exact_one && !elem.condition.is_empty() && !ch.body.is_empty() {
+                let entry = pred_candidates.entry(pred).or_insert((false, false));
+                entry.0 = true; // one V per L
+            }
+
+            // Pattern B: condition references type of arg[0], body references domain of arg[1]
+            // upper=1, condition on arg[0] type
+            if has_upper_one && !elem.condition.is_empty() && !ch.body.is_empty() {
+                let entry = pred_candidates.entry(pred).or_insert((false, false));
+                entry.1 = true; // at most one L per V
+            }
+        }
+    }
+
+    for (pred, (one_per_first, atmost_per_second)) in &pred_candidates {
+        if *one_per_first && *atmost_per_second {
+            alldiff_preds.insert(*pred);
+        }
+    }
+
+    if alldiff_preds.is_empty() { return None; }
+
+    // Step 2: For each rule body that has multiple atoms of an alldiff predicate
+    // with different first args (constants) and variable second args, inject !=
+    let mut modified = false;
+    let mut new_stmts = Vec::new();
+    for stmt in &program.statements {
+        if let Statement::Rule(r) = stmt {
+            let mut injected = inject_neq_for_alldiff(&r.body, &alldiff_preds, interner);
+            if !injected.is_empty() {
+                modified = true;
+                let mut new_body = r.body.clone();
+                new_body.append(&mut injected);
+                new_stmts.push(Statement::Rule(ast::Rule { head: r.head.clone(), body: new_body }));
+                continue;
+            }
+        }
+        new_stmts.push(stmt.clone());
+    }
+
+    if modified { Some(ast::Program { statements: new_stmts }) } else { None }
+}
+
+/// For a rule body, find pairs of alldiff predicate atoms with different constant
+/// first args and variable second args, and generate V1 != V2 comparisons.
+#[allow(dead_code)]
+fn inject_neq_for_alldiff(
+    body: &[ast::Literal],
+    alldiff_preds: &HashSet<SymbolId>,
+    _interner: &mut Interner,
+) -> Vec<ast::Literal> {
+    // Collect (predicate, first_arg_constant, second_arg_variable) triples
+    let mut pred_atoms: Vec<(SymbolId, SymbolId)> = Vec::new(); // (first_arg_as_symbol, second_arg_var)
+    for lit in body {
+        if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) = lit {
+            if !alldiff_preds.contains(&a.predicate) { continue; }
+            if a.args.len() != 2 { continue; }
+            // First arg must be a constant (Symbolic), second must be a Variable
+            if let (Term::Symbolic(first), Term::Variable(var)) = (&a.args[0], &a.args[1]) {
+                pred_atoms.push((*first, *var));
+            }
+        }
+    }
+
+    if pred_atoms.len() < 2 { return Vec::new(); }
+
+    // Collect existing != comparisons to avoid duplicates
+    let mut existing_neq: HashSet<(SymbolId, SymbolId)> = HashSet::new();
+    for lit in body {
+        if let ast::Literal::Pos(ast::BodyAtom::Comparison(c)) = lit
+            && c.op == ast::CompOp::Neq
+                && let (Term::Variable(a), Term::Variable(b)) = (&c.left, &c.right) {
+                    existing_neq.insert((*a, *b));
+                    existing_neq.insert((*b, *a));
+                }
+    }
+
+    // Generate != for all pairs of different-first-arg atoms
+    let mut injected = Vec::new();
+    for i in 0..pred_atoms.len() {
+        for j in i+1..pred_atoms.len() {
+            let (first_i, var_i) = pred_atoms[i];
+            let (first_j, var_j) = pred_atoms[j];
+            if first_i == first_j { continue; } // same first arg → same atom, skip
+            if var_i == var_j { continue; } // same variable → already the same
+            if existing_neq.contains(&(var_i, var_j)) { continue; } // already have this !=
+            injected.push(ast::Literal::Pos(ast::BodyAtom::Comparison(ast::Comparison {
+                left: Term::Variable(var_i),
+                op: ast::CompOp::Neq,
+                right: Term::Variable(var_j),
+            })));
+            existing_neq.insert((var_i, var_j));
+        }
+    }
+    injected
+}
 
 /// Magic set rewriting at the AST level. Detects constraints of the form
 /// `:- not p(V1,...,Vn), q(V1,...,Vn).` where p is defined by a rule and q
@@ -600,37 +731,84 @@ fn generate_bound_constraints(
         }
     };
 
-    // Upper bound: at most U can be true → "at least U+1 are true" must be false
+    // Threshold: use subset encoding for small n*k, staircase for large
+    let use_staircase = |n: usize, k: usize| -> bool {
+        // C(n,k) estimate: if > 1000 subsets, use staircase
+        if k > n { return false; }
+        let k = k.min(n - k); // C(n,k) = C(n,n-k)
+        let mut result = 1u64;
+        for i in 0..k {
+            result = result * (n - i) as u64 / (i + 1) as u64;
+            if result > 100_000 { return true; }
+        }
+        false
+    };
+
+    // Upper bound: at most U can be true
     if let Some(u_term) = upper
         && let Some(u) = eval_bound(u_term)
         && u < n
-        && let Some((aux_rules, result_id)) = build_staircase(heads, u + 1, interner, atom_table)
     {
-        rules.extend(aux_rules);
-        // :- body, result (too many are true → violation)
-        let mut bp = body_pos.to_vec();
-        bp.push(result_id);
-        rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
+        if use_staircase(n, u + 1) {
+            if let Some((aux_rules, result_id)) = build_staircase(heads, u + 1, interner, atom_table) {
+                rules.extend(aux_rules);
+                let mut bp = body_pos.to_vec();
+                bp.push(result_id);
+                rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
+            }
+        } else {
+            // Subset encoding: every (U+1)-subset must have a false atom
+            for_each_subset(heads, u + 1, &mut |subset| {
+                let mut bp = body_pos.to_vec();
+                bp.extend_from_slice(subset);
+                rules.push(GroundRule { head: RuleHead::Constraint, body_pos: bp, body_neg: body_neg.to_vec() });
+            });
+        }
     }
 
-    // Lower bound: at least L must be true → "at least L are true" must hold
+    // Lower bound: at least L must be true
     if let Some(l_term) = lower
         && let Some(l) = eval_bound(l_term)
         && l > 0
     {
         if l > n {
-            // Impossible: need more atoms than exist → always UNSAT when body holds
             rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: body_neg.to_vec() });
-        } else if let Some((aux_rules, result_id)) = build_staircase(heads, l, interner, atom_table) {
-            rules.extend(aux_rules);
-            // :- body, not result (too few are true → violation)
-            let mut bn = body_neg.to_vec();
-            bn.push(result_id);
-            rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
+        } else if use_staircase(n, n - l + 1) {
+            if let Some((aux_rules, result_id)) = build_staircase(heads, l, interner, atom_table) {
+                rules.extend(aux_rules);
+                let mut bn = body_neg.to_vec();
+                bn.push(result_id);
+                rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
+            }
+        } else {
+            let false_count = n - l + 1;
+            for_each_subset(heads, false_count, &mut |subset| {
+                let mut bn = body_neg.to_vec();
+                bn.extend_from_slice(subset);
+                rules.push(GroundRule { head: RuleHead::Constraint, body_pos: body_pos.to_vec(), body_neg: bn });
+            });
         }
     }
 
     rules
+}
+
+fn for_each_subset(elems: &[AtomId], k: usize, callback: &mut impl FnMut(&[AtomId])) {
+    if k == 0 { callback(&[]); return; }
+    if k > elems.len() { return; }
+    let mut indices: Vec<usize> = (0..k).collect();
+    loop {
+        let subset: Vec<AtomId> = indices.iter().map(|&i| elems[i]).collect();
+        callback(&subset);
+        let mut i = k;
+        loop {
+            if i == 0 { return; }
+            i -= 1;
+            indices[i] += 1;
+            if indices[i] <= elems.len() - k + i { break; }
+        }
+        for j in (i + 1)..k { indices[j] = indices[j - 1] + 1; }
+    }
 }
 
 /// Build staircase encoding: aux[i][j] = "at least j of the first i elements are true".
@@ -660,33 +838,30 @@ fn build_staircase(
         }
     }
 
-    // Base: aux[i][0] always true
+    // Base: aux[i][0] always true (use Normal head — these are unconditional facts)
     for row in &aux {
         rules.push(GroundRule { head: RuleHead::Normal(row[0]), body_pos: vec![], body_neg: vec![] });
     }
 
-    // Staircase: forward support + reverse completion constraints
     for i in 1..=n {
         for j in 1..=target.min(i) {
-            // Skip: aux[i][j] :- aux[i-1][j]
             rules.push(GroundRule {
                 head: RuleHead::Normal(aux[i][j]),
                 body_pos: vec![aux[i - 1][j]],
                 body_neg: vec![],
             });
-            // Include: aux[i][j] :- elem[i-1], aux[i-1][j-1]
             rules.push(GroundRule {
                 head: RuleHead::Normal(aux[i][j]),
                 body_pos: vec![elements[i - 1], aux[i - 1][j - 1]],
                 body_neg: vec![],
             });
-            // Completion: :- aux[i][j], not aux[i-1][j], not elem[i-1]
+            // Completion: aux[i][j] → aux[i-1][j] ∨ elem[i-1]
             rules.push(GroundRule {
                 head: RuleHead::Constraint,
                 body_pos: vec![aux[i][j]],
                 body_neg: vec![aux[i - 1][j], elements[i - 1]],
             });
-            // Completion: :- aux[i][j], not aux[i-1][j], not aux[i-1][j-1]
+            // Completion: aux[i][j] → aux[i-1][j] ∨ aux[i-1][j-1]
             rules.push(GroundRule {
                 head: RuleHead::Constraint,
                 body_pos: vec![aux[i][j]],
