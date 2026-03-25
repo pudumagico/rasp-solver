@@ -79,7 +79,87 @@ fn expand_body_ranges(body: &[ast::Literal], const_map: &HashMap<SymbolId, Value
         let expanded = expand_literal_ranges(lit, const_map);
         result.extend(expanded);
     }
-    vec![result]
+    vec![reorder_body_interleave_comparisons(result)]
+}
+
+/// Reorder body literals: place each comparison immediately after the atom
+/// that binds its last free variable. This ensures comparisons are checked
+/// as early as possible during enumeration.
+fn reorder_body_interleave_comparisons(body: Vec<ast::Literal>) -> Vec<ast::Literal> {
+    use std::collections::HashSet;
+    // Separate atoms and comparisons
+    let mut atoms: Vec<ast::Literal> = Vec::new();
+    let mut comps: Vec<ast::Literal> = Vec::new();
+    let mut others: Vec<ast::Literal> = Vec::new();
+    for lit in body {
+        match &lit {
+            ast::Literal::Pos(ast::BodyAtom::Comparison(_))
+            | ast::Literal::Neg(ast::BodyAtom::Comparison(_)) => comps.push(lit),
+            ast::Literal::Pos(ast::BodyAtom::Atom(_))
+            | ast::Literal::Neg(ast::BodyAtom::Atom(_)) => atoms.push(lit),
+            _ => others.push(lit),
+        }
+    }
+    if comps.is_empty() { atoms.extend(others); return atoms; }
+
+    // Build reordered body: after each atom, insert any comparisons
+    // whose variables are now all bound
+    let mut bound_vars: HashSet<SymbolId> = HashSet::new();
+    let mut result = Vec::with_capacity(atoms.len() + comps.len() + others.len());
+    let mut placed = vec![false; comps.len()];
+
+    for atom_lit in &atoms {
+        // Collect variables this atom binds
+        if let ast::Literal::Pos(ast::BodyAtom::Atom(a)) | ast::Literal::Neg(ast::BodyAtom::Atom(a)) = atom_lit {
+            for arg in &a.args {
+                collect_vars(arg, &mut bound_vars);
+            }
+        }
+        result.push(atom_lit.clone());
+
+        // Insert any now-evaluable comparisons
+        for (ci, comp) in comps.iter().enumerate() {
+            if placed[ci] { continue; }
+            let comp_vars = lit_vars(comp);
+            if comp_vars.is_subset(&bound_vars) {
+                result.push(comp.clone());
+                placed[ci] = true;
+            }
+        }
+    }
+    // Append remaining unplaced comparisons and others
+    for (ci, comp) in comps.into_iter().enumerate() {
+        if !placed[ci] { result.push(comp); }
+    }
+    result.extend(others);
+    result
+}
+
+fn collect_vars(term: &ast::Term, vars: &mut std::collections::HashSet<SymbolId>) {
+    match term {
+        ast::Term::Variable(v) => { vars.insert(*v); }
+        ast::Term::BinOp(_, l, r) => { collect_vars(l, vars); collect_vars(r, vars); }
+        ast::Term::UnaryMinus(t) | ast::Term::Abs(t) => collect_vars(t, vars),
+        ast::Term::Function(_, args) => args.iter().for_each(|a| collect_vars(a, vars)),
+        ast::Term::Pool(ts) => ts.iter().for_each(|t| collect_vars(t, vars)),
+        ast::Term::Range(a, b) => { collect_vars(a, vars); collect_vars(b, vars); }
+        _ => {}
+    }
+}
+
+fn lit_vars(lit: &ast::Literal) -> std::collections::HashSet<SymbolId> {
+    let mut vars = std::collections::HashSet::new();
+    match lit {
+        ast::Literal::Pos(ba) | ast::Literal::Neg(ba) => match ba {
+            ast::BodyAtom::Comparison(c) => {
+                collect_vars(&c.left, &mut vars);
+                collect_vars(&c.right, &mut vars);
+            }
+            ast::BodyAtom::Atom(a) => a.args.iter().for_each(|t| collect_vars(t, &mut vars)),
+            _ => {}
+        }
+    }
+    vars
 }
 
 /// Expand ranges within a single literal.
